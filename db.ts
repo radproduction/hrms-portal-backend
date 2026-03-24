@@ -23,6 +23,7 @@ import {
   EmployeeDocument,
   WorkSession,
 } from "./models";
+import { ENV } from "./_core/env";
 
 type UpsertUserInput = {
   openId: string;
@@ -299,6 +300,14 @@ export async function createTimeEntry(entry: {
   timeIn: Date;
   status: "active" | "completed" | "early_out";
   notes?: string;
+  location?: {
+    lat: number;
+    lng: number;
+    accuracy?: number;
+    address?: string;
+    source?: "gps" | "manual";
+    capturedAt?: Date;
+  };
 }) {
   await requireDb();
   const created = await TimeEntry.create({
@@ -1504,6 +1513,12 @@ export async function getEmployeeStatusSnapshot() {
   const users = await User.find({ role: "user" }).lean();
   const userIds = users.map((u: any) => u._id);
   const now = new Date();
+  const officeLat = Number.isFinite(ENV.officeLat) ? ENV.officeLat : null;
+  const officeLng = Number.isFinite(ENV.officeLng) ? ENV.officeLng : null;
+  const officeRadiusKm =
+    typeof ENV.officeRadiusKm === "number" && !Number.isNaN(ENV.officeRadiusKm)
+      ? ENV.officeRadiusKm
+      : 0.5;
 
   const activeEntries = await TimeEntry.find({ userId: { $in: userIds }, status: "active" }).lean();
   const activeEntryByUser = new Map(activeEntries.map((e: any) => [String(e.userId), e]));
@@ -1539,6 +1554,30 @@ export async function getEmployeeStatusSnapshot() {
       hours = `${(diffMs / (1000 * 60 * 60)).toFixed(1)}h`;
     }
 
+    const location = activeEntry?.location ?? null;
+    let distanceKm: number | null = null;
+    let locationTag: "office" | "remote" | null = null;
+    if (
+      location &&
+      typeof location.lat === "number" &&
+      typeof location.lng === "number" &&
+      officeLat !== null &&
+      officeLng !== null
+    ) {
+      const toRad = (deg: number) => (deg * Math.PI) / 180;
+      const dLat = toRad(location.lat - officeLat);
+      const dLng = toRad(location.lng - officeLng);
+      const lat1 = toRad(officeLat);
+      const lat2 = toRad(location.lat);
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+      const km = 6371 * c;
+      distanceKm = Number(km.toFixed(1));
+      locationTag = km <= officeRadiusKm ? "office" : "remote";
+    }
+
     return {
       id: String(u._id),
       name: u.name,
@@ -1546,6 +1585,9 @@ export async function getEmployeeStatusSnapshot() {
       status,
       timeIn,
       hours,
+      location,
+      locationDistanceKm: distanceKm,
+      locationTag,
     };
   });
 }

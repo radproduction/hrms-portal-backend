@@ -47,6 +47,14 @@ export interface ITimeEntry extends Document {
   totalHours?: number;
   status: 'active' | 'completed' | 'early_out';
   notes?: string;
+  location?: {
+    lat: number;
+    lng: number;
+    accuracy?: number;
+    address?: string;
+    source?: 'gps' | 'manual';
+    capturedAt?: Date;
+  };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -58,6 +66,14 @@ const timeEntrySchema = new Schema<ITimeEntry>({
   totalHours: Number,
   status: { type: String, enum: ['active', 'completed', 'early_out'], default: 'active', required: true },
   notes: String,
+  location: {
+    lat: Number,
+    lng: Number,
+    accuracy: Number,
+    address: String,
+    source: { type: String, enum: ['gps', 'manual'] },
+    capturedAt: Date,
+  },
 }, { timestamps: true });
 
 export const TimeEntry = model<ITimeEntry>('TimeEntry', timeEntrySchema);
