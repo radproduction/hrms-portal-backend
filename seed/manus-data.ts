@@ -1,128 +1,183 @@
-export type ManusUserSeed = {
+export type AdminFallbackSeed = {
   openId: string;
   name: string;
   email: string;
-  loginMethod: "custom";
-  role: "user" | "admin";
   employeeId: string;
-  passwordHash: string;
+  password: string;
   department: string;
   position: string;
 };
 
-export type ManusProjectSeed = {
+export type EmployeeSeed = {
+  openId: string;
   name: string;
-  description: string;
-  status: "active" | "on_hold" | "completed" | "cancelled";
-  priority: "low" | "medium" | "high";
-  createdByOpenId: string;
-  source?: "team_lead" | "employee";
+  email: string;
+  employeeId: string;
+  password: string;
+  department: string;
+  position: string;
+  cnic?: string;
+  mobilePhone?: string;
 };
 
-export type ManusProjectAssignmentSeed = {
-  projectName: string;
-  userOpenId: string;
-  role: string;
+export const adminFallbackSeed: AdminFallbackSeed = {
+  openId: "admin-aamir-001",
+  name: "Aamir",
+  email: "aamir@rad.com",
+  employeeId: "ADMIN001",
+  password: "Admin@123",
+  department: "Management",
+  position: "Founder & COO",
 };
 
-// Seed users captured from Manus DB logs (.manus/db/*.json).
-// Password hash corresponds to the "123" password in the original seed.
-const SEED_PASSWORD_HASH =
-  "$2b$10$WGscasGNs.ojsYycPzM9IuXiRySSrrGB26fDKuTUnRYpz9Tlrci6.";
-
-export const manusUsers: ManusUserSeed[] = [
+export const employeeSeeds: EmployeeSeed[] = [
   {
-    openId: "admin-aamir-001",
-    name: "Aamir",
-    email: "aamir@rad.com",
-    loginMethod: "custom",
-    role: "admin",
-    employeeId: "ADMIN001",
-    passwordHash: SEED_PASSWORD_HASH,
-    department: "Management",
-    position: "Founder & COO",
+    openId: "emp-talha-aziz",
+    name: "Talha Aziz",
+    email: "talha.aziz@wehearyou.studio",
+    employeeId: "Talha Aziz",
+    password: "Talha@7576",
+    department: "Design",
+    position: "Graphic Designer",
+    cnic: "42201-7475275-3",
+    mobilePhone: "0317-8927576",
   },
   {
-    openId: "hrms-hassan",
-    name: "Hassan",
-    email: "hassan@rad.com",
-    loginMethod: "custom",
-    role: "user",
-    employeeId: "EMP001",
-    passwordHash: SEED_PASSWORD_HASH,
+    openId: "emp-eshal-khurshid",
+    name: "Eshal Khurshid",
+    email: "eshal.khurshid@wehearyou.studio",
+    employeeId: "Eshal Khurshid",
+    password: "Eshal@9998",
+    department: "Finance",
+    position: "Account Manager",
+    cnic: "42301-6480817-2",
+    mobilePhone: "0301-8929998",
+  },
+  {
+    openId: "emp-fabeha",
+    name: "Fabeha",
+    email: "fabeha@wehearyou.studio",
+    employeeId: "Fabeha",
+    password: "Fabeha@7500",
+    department: "Design",
+    position: "Brand Manager",
+    cnic: "42201-8237782-0",
+    mobilePhone: "0333-2617500",
+  },
+  {
+    openId: "emp-arij-ali-khan",
+    name: "Arij Ali Khan",
+    email: "arij.khan@wehearyou.studio",
+    employeeId: "Arij Ali Khan",
+    password: "Arij@1194",
+    department: "Design",
+    position: "Visual Designer",
+    cnic: "42101-7843658-5",
+    mobilePhone: "0341-0291194",
+  },
+  {
+    openId: "emp-muhammad-hassan",
+    name: "Muhammad Hassan",
+    email: "hassan@wehearyou.studio",
+    employeeId: "Muhammad Hassan",
+    password: "Hassan@8346",
     department: "Engineering",
-    position: "Software Developer",
+    position: "Sr web Dev",
+    cnic: "42101-9630488-3",
+    mobilePhone: "0347-2228346",
   },
   {
-    openId: "hrms-talha",
-    name: "Talha",
-    email: "talha@rad.com",
-    loginMethod: "custom",
-    role: "user",
-    employeeId: "EMP002",
-    passwordHash: SEED_PASSWORD_HASH,
+    openId: "emp-arsalan-khan",
+    name: "Arsalan Khan",
+    email: "arsalan.khan@wehearyou.studio",
+    employeeId: "Arsalan Khan",
+    password: "Arsalan@4414",
+    department: "Marketing",
+    position: "Marketing Performance",
+    cnic: "42301-9828671-5",
+    mobilePhone: "0332-0044414",
+  },
+  {
+    openId: "emp-taha-yaseen",
+    name: "Taha Yaseen",
+    email: "taha.yaseen@wehearyou.studio",
+    employeeId: "Taha Yaseen",
+    password: "Taha@0976",
+    department: "Marketing",
+    position: "SEO Manager",
+    cnic: "42201-8844386-7",
+    mobilePhone: "0326-2856976",
+  },
+  {
+    openId: "emp-shaheryar-khan",
+    name: "Shaheryar Khan",
+    email: "shaheryar.khan@wehearyou.studio",
+    employeeId: "Shaheryar Khan",
+    password: "Shaheryar@5278",
+    department: "Design",
+    position: "Graphic Designer",
+    cnic: "42201-1177439-9",
+    mobilePhone: "0335-2615278",
+  },
+  {
+    openId: "emp-muzamil-pervaiz",
+    name: "Muzamil Pervaiz",
+    email: "muzamil.pervaiz@wehearyou.studio",
+    employeeId: "Muzamil Pervaiz",
+    password: "Muzamil@7400",
+    department: "Finance",
+    position: "Finance",
+    cnic: "45203-4548175-5",
+    mobilePhone: "0301-3437400",
+  },
+  {
+    openId: "emp-fayyaz",
+    name: "Fayyaz",
+    email: "fayyaz.hussain@wehearyou.studio",
+    employeeId: "Fayyaz",
+    password: "Fayyaz@9744",
     department: "Engineering",
-    position: "Software Developer",
-  },
-];
-
-export const manusProjects: ManusProjectSeed[] = [
-  {
-    name: "Rad.flow HRMS Development",
-    description:
-      "Complete HRMS portal with time tracking, leave management, and project management",
-    status: "active",
-    priority: "high",
-    createdByOpenId: "hrms-hassan",
-    source: "team_lead",
+    position: "Sr web Dev",
+    mobilePhone: "0319-4089744",
   },
   {
-    name: "Website Redesign Project",
-    description: "Redesign company website with modern UI/UX",
-    status: "active",
-    priority: "medium",
-    createdByOpenId: "hrms-hassan",
-    source: "team_lead",
+    openId: "emp-muhammad-anas",
+    name: "Muhammad Anas",
+    email: "muhammad.anas@wehearyou.studio",
+    employeeId: "Muhammad Anas",
+    password: "Anas@5969",
+    department: "Marketing",
+    position: "SEO",
+    cnic: "41304-3973357-5",
+    mobilePhone: "0313-3165969",
   },
   {
-    name: "Mobile App Development",
-    description: "Develop mobile application for employee portal",
-    status: "active",
-    priority: "high",
-    createdByOpenId: "hrms-hassan",
-    source: "team_lead",
-  },
-];
-
-export const manusProjectAssignments: ManusProjectAssignmentSeed[] = [
-  {
-    projectName: "Rad.flow HRMS Development",
-    userOpenId: "hrms-hassan",
-    role: "Lead Developer",
+    openId: "emp-muhammad-owais",
+    name: "Muhammad Owais",
+    email: "muhammad.owais@wehearyou.studio",
+    employeeId: "Muhammad Owais",
+    password: "Owais@6646",
+    department: "Engineering",
+    position: "Web Dev",
+    cnic: "42101-7898319-9",
+    mobilePhone: "0317-3616646",
   },
   {
-    projectName: "Rad.flow HRMS Development",
-    userOpenId: "hrms-talha",
-    role: "Frontend Developer",
+    openId: "emp-tayaba-aslam",
+    name: "Tayaba Aslam",
+    email: "tayaba.aslam@wehearyou.studio",
+    employeeId: "Tayaba Aslam",
+    password: "Tayaba@HR13",
+    department: "Design",
+    position: "Brand Manager",
   },
   {
-    projectName: "Website Redesign Project",
-    userOpenId: "hrms-hassan",
-    role: "UI/UX Designer",
-  },
-  {
-    projectName: "Website Redesign Project",
-    userOpenId: "hrms-talha",
-    role: "Developer",
-  },
-  {
-    projectName: "Mobile App Development",
-    userOpenId: "hrms-hassan",
-    role: "Backend Developer",
-  },
-  {
-    projectName: "Mobile App Development",
-    userOpenId: "hrms-talha",
-    role: "Mobile Developer",
+    openId: "emp-muhammad-ali",
+    name: "Muhammad Ali",
+    email: "muhammad.ali@wehearyou.studio",
+    employeeId: "Muhammad Ali",
+    password: "MuhammadAli@HR14",
+    department: "Finance",
+    position: "Account Manager",
   },
 ];

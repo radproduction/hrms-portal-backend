@@ -1,112 +1,180 @@
 import "dotenv/config";
+import bcrypt from "bcryptjs";
 import mongoose from "mongoose";
 import { connectToMongoDB } from "../mongodb";
-import { Project, ProjectAssignment, User } from "../models";
-import { manusProjectAssignments, manusProjects, manusUsers } from "./manus-data";
+import {
+  AnnouncementRead,
+  BreakLog,
+  CalendarEvent,
+  ChatMessage,
+  Compensation,
+  ComplianceRecord,
+  EmployeeAuditLog,
+  EmployeeDocument,
+  EmployeeProfile,
+  EmploymentDetail,
+  FormSubmission,
+  JobHistory,
+  LeaveApplication,
+  Meeting,
+  MeetingParticipant,
+  Note,
+  Notification,
+  OvertimeEntry,
+  Payslip,
+  PerformanceRecord,
+  Project,
+  ProjectAssignment,
+  ProjectTask,
+  Qualification,
+  TimeEntry,
+  User,
+  WorkSession,
+} from "../models";
+import { adminFallbackSeed, employeeSeeds } from "./manus-data";
 
-async function upsertUsers() {
-  const usersByOpenId = new Map<string, mongoose.Types.ObjectId>();
-
-  for (const user of manusUsers) {
-    const existing = await User.findOne({ openId: user.openId });
-    if (!existing) {
-      const created = await User.create({
-        openId: user.openId,
-        name: user.name,
-        email: user.email,
-        loginMethod: user.loginMethod,
-        role: user.role,
-        employeeId: user.employeeId,
-        password: user.passwordHash,
-        department: user.department,
-        position: user.position,
-        lastSignedIn: new Date(),
-      });
-      usersByOpenId.set(user.openId, created._id);
-      continue;
-    }
-
-    existing.name = user.name;
-    existing.email = user.email;
-    existing.loginMethod = user.loginMethod;
-    existing.role = user.role;
-    existing.employeeId = user.employeeId;
-    existing.department = user.department;
-    existing.position = user.position;
-    if (!existing.password) {
-      existing.password = user.passwordHash;
-    }
-    await existing.save();
-    usersByOpenId.set(user.openId, existing._id);
+async function ensureAdminUser() {
+  const existingAdmin = await User.findOne({ role: "admin" });
+  if (existingAdmin) {
+    return existingAdmin;
   }
 
-  return usersByOpenId;
+  const passwordHash = await bcrypt.hash(adminFallbackSeed.password, 10);
+  return await User.create({
+    openId: adminFallbackSeed.openId,
+    name: adminFallbackSeed.name,
+    email: adminFallbackSeed.email,
+    loginMethod: "custom",
+    role: "admin",
+    employeeId: adminFallbackSeed.employeeId,
+    password: passwordHash,
+    department: adminFallbackSeed.department,
+    position: adminFallbackSeed.position,
+    lastSignedIn: new Date(),
+  });
 }
 
-async function upsertProjects(usersByOpenId: Map<string, mongoose.Types.ObjectId>) {
-  const projectsByName = new Map<string, mongoose.Types.ObjectId>();
+async function purgeNonAdminData() {
+  const existingEmployees = await User.find({ role: { $ne: "admin" } }).select("_id").lean();
+  const employeeIds = existingEmployees.map(user => user._id);
 
-  for (const project of manusProjects) {
-    const createdBy = usersByOpenId.get(project.createdByOpenId);
-    if (!createdBy) {
-      throw new Error(`Missing user for project createdBy: ${project.createdByOpenId}`);
-    }
-
-    const existing = await Project.findOne({ name: project.name });
-    if (!existing) {
-      const created = await Project.create({
-        name: project.name,
-        description: project.description,
-        status: project.status,
-        priority: project.priority,
-        source: project.source ?? "team_lead",
-        createdBy,
-      });
-      projectsByName.set(project.name, created._id);
-      continue;
-    }
-
-    existing.description = project.description;
-    existing.status = project.status;
-    existing.priority = project.priority;
-    existing.source = project.source ?? existing.source;
-    existing.createdBy = createdBy;
-    await existing.save();
-    projectsByName.set(project.name, existing._id);
+  if (employeeIds.length === 0) {
+    return;
   }
 
-  return projectsByName;
+  const timeEntryIds = (await TimeEntry.find({ userId: { $in: employeeIds } }).select("_id").lean()).map(
+    entry => entry._id
+  );
+  const meetingIds = (await Meeting.find({ organizerId: { $in: employeeIds } }).select("_id").lean()).map(
+    meeting => meeting._id
+  );
+  const projectIds = (await Project.find({ createdBy: { $in: employeeIds } }).select("_id").lean()).map(
+    project => project._id
+  );
+
+  await BreakLog.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { timeEntryId: { $in: timeEntryIds } }],
+  });
+  await OvertimeEntry.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { projectId: { $in: projectIds } }],
+  });
+  await WorkSession.deleteMany({ userId: { $in: employeeIds } });
+  await TimeEntry.deleteMany({ userId: { $in: employeeIds } });
+  await LeaveApplication.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { approvedBy: { $in: employeeIds } }],
+  });
+  await FormSubmission.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { respondedBy: { $in: employeeIds } }],
+  });
+  await ChatMessage.deleteMany({
+    $or: [{ senderId: { $in: employeeIds } }, { recipientId: { $in: employeeIds } }],
+  });
+  await Note.deleteMany({ userId: { $in: employeeIds } });
+  await Payslip.deleteMany({ userId: { $in: employeeIds } });
+  await Notification.deleteMany({ userId: { $in: employeeIds } });
+  await AnnouncementRead.deleteMany({ userId: { $in: employeeIds } });
+  await EmployeeProfile.deleteMany({ userId: { $in: employeeIds } });
+  await EmploymentDetail.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { supervisorId: { $in: employeeIds } }],
+  });
+  await JobHistory.deleteMany({ userId: { $in: employeeIds } });
+  await Compensation.deleteMany({ userId: { $in: employeeIds } });
+  await PerformanceRecord.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { reviewerId: { $in: employeeIds } }],
+  });
+  await Qualification.deleteMany({ userId: { $in: employeeIds } });
+  await EmployeeDocument.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { uploadedBy: { $in: employeeIds } }],
+  });
+  await ComplianceRecord.deleteMany({ userId: { $in: employeeIds } });
+  await EmployeeAuditLog.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { changedBy: { $in: employeeIds } }],
+  });
+  await CalendarEvent.deleteMany({ userId: { $in: employeeIds } });
+  await MeetingParticipant.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { meetingId: { $in: meetingIds } }],
+  });
+  await Meeting.deleteMany({ organizerId: { $in: employeeIds } });
+  await ProjectTask.deleteMany({
+    $or: [
+      { userId: { $in: employeeIds } },
+      { assigneeIds: { $in: employeeIds } },
+      { projectId: { $in: projectIds } },
+    ],
+  });
+  await ProjectAssignment.deleteMany({
+    $or: [{ userId: { $in: employeeIds } }, { projectId: { $in: projectIds } }],
+  });
+  await Project.deleteMany({ createdBy: { $in: employeeIds } });
+  await User.deleteMany({ _id: { $in: employeeIds } });
 }
 
-async function upsertProjectAssignments(
-  usersByOpenId: Map<string, mongoose.Types.ObjectId>,
-  projectsByName: Map<string, mongoose.Types.ObjectId>
-) {
-  for (const assignment of manusProjectAssignments) {
-    const userId = usersByOpenId.get(assignment.userOpenId);
-    const projectId = projectsByName.get(assignment.projectName);
-    if (!userId) {
-      throw new Error(`Missing user for assignment: ${assignment.userOpenId}`);
-    }
-    if (!projectId) {
-      throw new Error(`Missing project for assignment: ${assignment.projectName}`);
-    }
+async function seedEmployees() {
+  const createdUsers: Array<{
+    name: string;
+    employeeId: string;
+    password: string;
+  }> = [];
 
-    const existing = await ProjectAssignment.findOne({
-      userId,
-      projectId,
-      role: assignment.role,
+  for (const employee of employeeSeeds) {
+    const passwordHash = await bcrypt.hash(employee.password, 10);
+    const created = await User.create({
+      openId: employee.openId,
+      name: employee.name,
+      email: employee.email,
+      loginMethod: "custom",
+      role: "user",
+      employeeId: employee.employeeId,
+      password: passwordHash,
+      department: employee.department,
+      position: employee.position,
+      lastSignedIn: new Date(0),
     });
 
-    if (!existing) {
-      await ProjectAssignment.create({
-        userId,
-        projectId,
-        role: assignment.role,
-        assignedAt: new Date(),
-      });
-    }
+    await EmployeeProfile.create({
+      userId: created._id,
+      cnic: employee.cnic,
+      personalEmail: employee.email,
+      mobilePhone: employee.mobilePhone,
+    });
+
+    await EmploymentDetail.create({
+      userId: created._id,
+      jobTitle: employee.position,
+      department: employee.department,
+      employmentStatus: "full_time",
+      weeklyHours: 40,
+      joinedDate: new Date(),
+    });
+
+    createdUsers.push({
+      name: employee.name,
+      employeeId: employee.employeeId,
+      password: employee.password,
+    });
   }
+
+  return createdUsers;
 }
 
 async function run() {
@@ -116,11 +184,15 @@ async function run() {
     process.exit(1);
   }
 
-  const usersByOpenId = await upsertUsers();
-  const projectsByName = await upsertProjects(usersByOpenId);
-  await upsertProjectAssignments(usersByOpenId, projectsByName);
+  await ensureAdminUser();
+  await purgeNonAdminData();
+  const createdUsers = await seedEmployees();
 
-  console.log("[Seed] Manus data seeded successfully.");
+  console.log("[Seed] Employee data seeded successfully.");
+  console.log("[Seed] Credentials:");
+  createdUsers.forEach(user => {
+    console.log(`- ${user.name} | Login: ${user.employeeId} | Password: ${user.password}`);
+  });
   await mongoose.connection.close();
 }
 

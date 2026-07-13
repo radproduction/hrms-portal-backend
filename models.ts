@@ -440,6 +440,7 @@ export interface IEmployeeProfile extends Document {
   gender?: 'male' | 'female' | 'other';
   maritalStatus?: 'single' | 'married' | 'divorced' | 'widowed';
   nationality?: string;
+  cnic?: string;
   personalEmail?: string;
   homePhone?: string;
   mobilePhone?: string;
@@ -459,6 +460,7 @@ const employeeProfileSchema = new Schema<IEmployeeProfile>({
   gender: { type: String, enum: ['male', 'female', 'other'] },
   maritalStatus: { type: String, enum: ['single', 'married', 'divorced', 'widowed'] },
   nationality: String,
+  cnic: String,
   personalEmail: String,
   homePhone: String,
   mobilePhone: String,
