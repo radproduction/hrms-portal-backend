@@ -10,6 +10,7 @@ import avatarUploadRouter from "../avatar-upload";
 import employeeDocumentUploadRouter from "../employee-document-upload";
 import { connectToMongoDB } from "../mongodb";
 import { initRealtime } from "./realtime";
+import wingmanClockRouter from "../wingman-clock-router";
 
 async function startServer() {
   await connectToMongoDB();
@@ -36,6 +37,7 @@ async function startServer() {
   app.use(avatarUploadRouter);
   // Employee document upload endpoint
   app.use(employeeDocumentUploadRouter);
+  app.use(wingmanClockRouter);
   // tRPC API
   app.use(
     "/api/trpc",

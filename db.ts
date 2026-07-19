@@ -169,6 +169,14 @@ export async function getUserByEmployeeIdAndPassword(
   return sanitizeUser(normalizeDoc(user));
 }
 
+export async function getUserByEmployeeIdentifier(identifier: string) {
+  if (!(await optionalDb())) return undefined;
+  const user = await User.findOne({
+    $or: [{ employeeId: identifier }, { email: identifier }],
+  }).lean();
+  return sanitizeUser(normalizeDoc(user));
+}
+
 export async function verifyUserPassword(userId: string, password: string) {
   if (!(await optionalDb())) return false;
   const user = await User.findById(toObjectId(userId)).lean();

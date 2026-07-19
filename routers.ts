@@ -9,6 +9,7 @@ import { createSessionToken, setSessionCookie, verifySessionToken } from "./_cor
 import { authenticator } from "otplib";
 import { toDataURL } from "qrcode";
 import { emitChatMessage, emitNotification, emitAnnouncement } from "./_core/realtime";
+import { clockInUser, clockOutUser, WorkClockError } from "./wingman";
 
 export const appRouter = router({
   system: systemRouter,
@@ -214,26 +215,18 @@ export const appRouter = router({
           .optional()
       )
       .mutation(async ({ ctx, input }) => {
-      const activeEntry = await db.getActiveTimeEntry(ctx.user.id);
-      
-      if (activeEntry) {
-        throw new TRPCError({
-          code: "BAD_REQUEST",
-          message: "You are already clocked in",
-        });
-      }
-
-      await db.createTimeEntry({
-        userId: ctx.user.id,
-        timeIn: new Date(),
-        status: "active",
-        location: input?.location
-          ? { ...input.location, capturedAt: new Date() }
-          : undefined,
-      });
-
-      return { success: true };
-    }),
+        try {
+          return await clockInUser(ctx.user.id, { location: input?.location });
+        } catch (error) {
+          if (error instanceof WorkClockError) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message: error.message,
+            });
+          }
+          throw error;
+        }
+      }),
 
     // Clock out
     clockOut: protectedProcedure
@@ -241,33 +234,17 @@ export const appRouter = router({
         notes: z.string().optional(),
       }))
       .mutation(async ({ input, ctx }) => {
-        const activeEntry = await db.getActiveTimeEntry(ctx.user.id);
-        
-        if (!activeEntry) {
-          throw new TRPCError({
-            code: "BAD_REQUEST",
-            message: "No active time entry found",
-          });
+        try {
+          return await clockOutUser(ctx.user.id, { notes: input.notes });
+        } catch (error) {
+          if (error instanceof WorkClockError) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message: error.message,
+            });
+          }
+          throw error;
         }
-
-        const timeOut = new Date();
-        const timeIn = new Date(activeEntry.timeIn);
-        const totalHours = (timeOut.getTime() - timeIn.getTime()) / (1000 * 60 * 60);
-        
-        const status = totalHours < 6.5 ? "early_out" : "completed";
-
-        await db.updateTimeEntry(activeEntry.id, {
-          timeOut,
-          totalHours: Number(totalHours.toFixed(2)),
-          status,
-          notes: input.notes,
-        });
-
-        return { 
-          success: true, 
-          totalHours: parseFloat(totalHours.toFixed(2)),
-          status,
-        };
       }),
 
     // Add work session (manual entry after clock out)
