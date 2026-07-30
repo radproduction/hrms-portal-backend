@@ -1296,6 +1296,50 @@ export const appRouter = router({
         return { success: true, payslip, wasReplaced };
       }),
 
+    setPayslipPaid: protectedProcedure
+      .input(
+        z.object({
+          payslipId: z.string().min(1),
+          paid: z.boolean(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        if (ctx.user.role !== "admin") {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+
+        const payslip = await db.setPayslipPaidStatus(input.payslipId, input.paid);
+        if (!payslip) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Payslip not found" });
+        }
+
+        const employeeId = String((payslip as any).userId);
+        const period = formatPayPeriod(
+          Number((payslip as any).month),
+          Number((payslip as any).year)
+        );
+
+        // Only announce the payment itself; reverting to pending is a
+        // correction and should not ping the employee.
+        if (input.paid) {
+          const netSalary = Number((payslip as any).netSalary ?? 0);
+          await db.createNotification({
+            userId: employeeId,
+            type: "payslip_issued",
+            title: `Salary paid for ${period}`,
+            message: `Your ${period} salary of PKR ${netSalary.toLocaleString()} has been marked as paid.`,
+            priority: "medium",
+            relatedId: (payslip as any).id,
+            relatedType: "payslip",
+          });
+          emitNotification({ userId: employeeId });
+        }
+
+        emitPayslip({ userId: employeeId });
+
+        return { success: true, payslip };
+      }),
+
     getAnnouncements: protectedProcedure.query(async ({ ctx }) => {
       if (ctx.user.role !== "admin") {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
