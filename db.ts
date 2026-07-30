@@ -601,6 +601,61 @@ export async function getPayslipsByUser(userId: string) {
   return normalizeDocs(payslips);
 }
 
+/**
+ * Creates the payslip for a given employee/month, or replaces it if one already
+ * exists for that period. Re-issuing a corrected payslip is a normal admin
+ * action, so this upserts instead of erroring out.
+ */
+export async function upsertPayslip(input: {
+  userId: string;
+  month: number;
+  year: number;
+  basicSalary: number;
+  allowances: number;
+  deductions: number;
+  netSalary: number;
+  workingDays?: number;
+  presentDays?: number;
+  documentUrl?: string;
+  issuedBy: string;
+  paidAt?: Date;
+}) {
+  await requireDb();
+  const userObjectId = toObjectId(input.userId);
+
+  const existing = await Payslip.findOne({
+    userId: userObjectId,
+    month: input.month,
+    year: input.year,
+  }).lean();
+
+  const payload = {
+    userId: userObjectId,
+    month: input.month,
+    year: input.year,
+    basicSalary: input.basicSalary,
+    allowances: input.allowances,
+    deductions: input.deductions,
+    netSalary: input.netSalary,
+    workingDays: input.workingDays ?? 0,
+    presentDays: input.presentDays ?? 0,
+    documentUrl: input.documentUrl,
+    issuedBy: toObjectId(input.issuedBy),
+    paidAt: input.paidAt,
+  };
+
+  const saved = await Payslip.findOneAndUpdate(
+    { userId: userObjectId, month: input.month, year: input.year },
+    payload,
+    { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
+  ).lean();
+
+  return {
+    payslip: normalizeDoc(saved),
+    wasReplaced: Boolean(existing),
+  };
+}
+
 export async function getActiveAnnouncements() {
   if (!(await optionalDb())) return [];
   const now = new Date();

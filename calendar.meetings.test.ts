@@ -1,9 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
+import { describeWithDb } from "./test-utils";
 
-describe("Calendar and Meeting System", () => {
-  const mockContext: TrpcContext = {
+// Writes real documents, so it only runs against a throwaway TEST_MONGODB_URI.
+describeWithDb("Calendar and Meeting System", () => {
+  const mockContext = {
     user: {
       id: "000000000000000000000001",
       openId: "test-user",
@@ -12,7 +14,7 @@ describe("Calendar and Meeting System", () => {
       role: "user",
       employeeId: "EMP001",
     },
-  };
+  } as unknown as TrpcContext;
 
   const caller = appRouter.createCaller(mockContext);
 
@@ -30,7 +32,7 @@ describe("Calendar and Meeting System", () => {
       });
 
       expect(meeting).toBeDefined();
-      expect(meeting.title).toBe("Team Standup");
+      expect((meeting as any).title).toBe("Team Standup");
     });
 
     it("should get user's meetings", async () => {
@@ -67,16 +69,18 @@ describe("Calendar and Meeting System", () => {
       });
 
       expect(event).toBeDefined();
-      expect(event.title).toBe("Project Deadline");
+      expect((event as any).title).toBe("Project Deadline");
     });
 
     it("should get user's calendar events", async () => {
-      const events = await caller.calendar.getEventsByDateRange({
+      // getEventsByDateRange returns { events, meetings }, not a bare array.
+      const result = await caller.calendar.getEventsByDateRange({
         startDate: new Date("2026-02-01"),
         endDate: new Date("2026-03-31"),
       });
 
-      expect(Array.isArray(events)).toBe(true);
+      expect(Array.isArray(result.events)).toBe(true);
+      expect(Array.isArray(result.meetings)).toBe(true);
     });
   });
 });

@@ -8,8 +8,9 @@ import { TRPCError } from "@trpc/server";
 import { createSessionToken, setSessionCookie, verifySessionToken } from "./_core/auth";
 import { authenticator } from "otplib";
 import { toDataURL } from "qrcode";
-import { emitChatMessage, emitNotification, emitAnnouncement } from "./_core/realtime";
+import { emitChatMessage, emitNotification, emitAnnouncement, emitPayslip } from "./_core/realtime";
 import { clockInUser, clockOutUser, WorkClockError } from "./wingman";
+import { computePayslipAmounts, formatPayPeriod } from "./payroll";
 
 export const appRouter = router({
   system: systemRouter,
@@ -1224,6 +1225,76 @@ export const appRouter = router({
       }
       return await db.getAllPayslipsWithUsers();
     }),
+
+    createPayslip: protectedProcedure
+      .input(
+        z.object({
+          userId: z.string().min(1, "Select an employee"),
+          month: z.number().int().min(1).max(12),
+          year: z.number().int().min(2000).max(2100),
+          basicSalary: z.number().nonnegative(),
+          allowances: z.number().nonnegative().default(0),
+          deductions: z.number().nonnegative().default(0),
+          workingDays: z.number().int().min(0).max(31).optional(),
+          presentDays: z.number().int().min(0).max(31).optional(),
+          documentUrl: z.string().optional(),
+          markPaid: z.boolean().default(false),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        if (ctx.user.role !== "admin") {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+
+        const employee = await db.getUserById(input.userId);
+        if (!employee) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Employee not found" });
+        }
+
+        const amounts = computePayslipAmounts({
+          basicSalary: input.basicSalary,
+          allowances: input.allowances,
+          deductions: input.deductions,
+        });
+
+        if (amounts.netSalary < 0) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Deductions cannot exceed basic salary plus allowances",
+          });
+        }
+
+        const { payslip, wasReplaced } = await db.upsertPayslip({
+          userId: input.userId,
+          month: input.month,
+          year: input.year,
+          ...amounts,
+          workingDays: input.workingDays,
+          presentDays: input.presentDays,
+          documentUrl: input.documentUrl,
+          issuedBy: ctx.user.id,
+          paidAt: input.markPaid ? new Date() : undefined,
+        });
+
+        const period = formatPayPeriod(input.month, input.year);
+
+        await db.createNotification({
+          userId: input.userId,
+          type: "payslip_issued",
+          title: wasReplaced ? `Payslip updated for ${period}` : `Payslip available for ${period}`,
+          message: wasReplaced
+            ? `Your ${period} payslip has been updated. Net salary: PKR ${amounts.netSalary.toLocaleString()}.`
+            : `Your ${period} payslip is now available. Net salary: PKR ${amounts.netSalary.toLocaleString()}.`,
+          priority: "medium",
+          relatedId: payslip?.id,
+          relatedType: "payslip",
+        });
+
+        emitNotification({ userId: input.userId });
+        emitPayslip({ userId: input.userId });
+
+        return { success: true, payslip, wasReplaced };
+      }),
 
     getAnnouncements: protectedProcedure.query(async ({ ctx }) => {
       if (ctx.user.role !== "admin") {
