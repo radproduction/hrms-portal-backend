@@ -66,3 +66,8 @@ export function emitAnnouncement(payload: { announcementId?: string }) {
   if (!io) return;
   io.emit("announcements:new", payload);
 }
+
+export function emitPayslip(payload: { userId: string }) {
+  if (!io) return;
+  io.to(payload.userId).emit("payslips:new", payload);
+}

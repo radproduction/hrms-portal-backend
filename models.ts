@@ -260,8 +260,11 @@ export interface IPayslip extends Document {
   netSalary: number;
   workingDays: number;
   presentDays: number;
+  documentUrl?: string;
+  issuedBy?: Types.ObjectId;
   paidAt?: Date;
   createdAt: Date;
+  updatedAt: Date;
 }
 
 const payslipSchema = new Schema<IPayslip>({
@@ -272,11 +275,16 @@ const payslipSchema = new Schema<IPayslip>({
   allowances: { type: Number, default: 0 },
   deductions: { type: Number, default: 0 },
   netSalary: { type: Number, required: true },
-  workingDays: { type: Number, required: true },
-  presentDays: { type: Number, required: true },
+  workingDays: { type: Number, default: 0 },
+  presentDays: { type: Number, default: 0 },
+  documentUrl: String,
+  issuedBy: { type: Schema.Types.ObjectId, ref: 'User' },
   paidAt: Date,
-  createdAt: { type: Date, default: Date.now },
-});
+}, { timestamps: true });
+
+// One payslip per employee per month, and it also backs the
+// getPayslipsByUser / getLatestPayslip sorts.
+payslipSchema.index({ userId: 1, year: -1, month: -1 });
 
 export const Payslip = model<IPayslip>('Payslip', payslipSchema);
 
@@ -386,7 +394,7 @@ export const ProjectTask = model<IProjectTask>('ProjectTask', projectTaskSchema)
 export interface INotification extends Document {
   _id: Types.ObjectId;
   userId: Types.ObjectId;
-  type: 'project_assigned' | 'attendance_issue' | 'hours_shortfall' | 'leave_approved' | 'leave_rejected' | 'announcement' | 'system_alert';
+  type: 'project_assigned' | 'attendance_issue' | 'hours_shortfall' | 'leave_approved' | 'leave_rejected' | 'announcement' | 'payslip_issued' | 'system_alert';
   title: string;
   message: string;
   priority: 'low' | 'medium' | 'high';
@@ -400,8 +408,8 @@ const notificationSchema = new Schema<INotification>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   type: { 
     type: String, 
-    enum: ['project_assigned', 'attendance_issue', 'hours_shortfall', 'leave_approved', 'leave_rejected', 'announcement', 'system_alert'], 
-    required: true 
+    enum: ['project_assigned', 'attendance_issue', 'hours_shortfall', 'leave_approved', 'leave_rejected', 'announcement', 'payslip_issued', 'system_alert'],
+    required: true
   },
   title: { type: String, required: true },
   message: { type: String, required: true },

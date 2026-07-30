@@ -1,6 +1,7 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
+import { describeWithDb } from "./test-utils";
 type AuthenticatedUser = NonNullable<TrpcContext["user"]>;
 
 function createAuthContext(
@@ -31,7 +32,7 @@ function createAuthContext(
     res: {
       cookie: () => {},
       clearCookie: () => {},
-    } as TrpcContext["res"],
+    } as unknown as TrpcContext["res"],
   };
 
   return { ctx };
@@ -122,6 +123,17 @@ describe("Dashboard", () => {
     const result = await caller.dashboard.getUsers();
 
     expect(Array.isArray(result)).toBe(true);
+  });
+});
+
+// Asserts on seeded rows, so it needs a real (throwaway) database.
+describeWithDb("Dashboard (requires database)", () => {
+  it("should return at least one user", async () => {
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.dashboard.getUsers();
+
     expect(result.length).toBeGreaterThan(0);
   });
 });
