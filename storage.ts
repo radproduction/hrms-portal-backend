@@ -1,7 +1,22 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-const UPLOADS_DIR = path.resolve(import.meta.dirname, "uploads");
+/**
+ * Single source of truth for where uploads live. Both the writer (storagePut)
+ * and the static file server import this.
+ *
+ * It must NOT be derived from import.meta.dirname: the production build bundles
+ * this file into dist/index.js, so import.meta.dirname becomes dist/ here while
+ * the server previously resolved dist/../uploads. Files were written to
+ * dist/uploads and served from uploads/, so every download 404'd in production
+ * while working fine in dev.
+ *
+ * Set UPLOADS_DIR to a mounted volume in production, otherwise uploads live on
+ * the container's ephemeral disk and disappear on the next deploy.
+ */
+export const UPLOADS_DIR = process.env.UPLOADS_DIR
+  ? path.resolve(process.env.UPLOADS_DIR)
+  : path.resolve(process.cwd(), "uploads");
 
 function normalizeKey(relKey: string): string {
   return relKey.replace(/^\/+/, "").replace(/\\/g, "/");
