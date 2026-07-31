@@ -127,6 +127,86 @@ describeWithDb("Admin payslip issuing flow", () => {
     expect((payslips[0] as any).netSalary).toBe(95000);
   });
 
+  it("marks an already-issued payslip as paid later and notifies the employee", async () => {
+    const admin = appRouter.createCaller(ctxFor(adminId, "admin"));
+    const employee = appRouter.createCaller(ctxFor(employeeId, "user"));
+
+    // Issue without markPaid, the way an admin does before the transfer clears.
+    const issued = await admin.admin.createPayslip({
+      userId: employeeId,
+      month: 9,
+      year: 2026,
+      basicSalary: 200000,
+    });
+    expect((issued.payslip as any)?.paidAt).toBeUndefined();
+
+    const payslipId = (issued.payslip as any).id;
+    const notificationsBefore = (await employee.notifications.getAll()).length;
+
+    const paid = await admin.admin.setPayslipPaid({ payslipId, paid: true });
+    expect(paid.success).toBe(true);
+    expect((paid.payslip as any).paidAt).toBeInstanceOf(Date);
+
+    // The employee's own view reflects it.
+    const mine = (await employee.dashboard.getPayslips()).find(
+      (p: any) => p.id === payslipId
+    );
+    expect((mine as any).paidAt).toBeInstanceOf(Date);
+
+    // ...and they were told about the payment.
+    const after = await employee.notifications.getAll();
+    expect(after.length).toBe(notificationsBefore + 1);
+    expect((after[0] as any).title).toContain("Salary paid for September 2026");
+  });
+
+  it("can revert a payslip to pending without notifying again", async () => {
+    const admin = appRouter.createCaller(ctxFor(adminId, "admin"));
+    const employee = appRouter.createCaller(ctxFor(employeeId, "user"));
+
+    const issued = await admin.admin.createPayslip({
+      userId: employeeId,
+      month: 10,
+      year: 2026,
+      basicSalary: 100000,
+      markPaid: true,
+    });
+    const payslipId = (issued.payslip as any).id;
+
+    const notificationsBefore = (await employee.notifications.getAll()).length;
+    const reverted = await admin.admin.setPayslipPaid({ payslipId, paid: false });
+
+    expect((reverted.payslip as any).paidAt).toBeUndefined();
+    // Reverting is a correction, not an announcement.
+    expect((await employee.notifications.getAll()).length).toBe(notificationsBefore);
+  });
+
+  it("refuses a non-admin marking a payslip paid", async () => {
+    const admin = appRouter.createCaller(ctxFor(adminId, "admin"));
+    const employee = appRouter.createCaller(ctxFor(employeeId, "user"));
+
+    const issued = await admin.admin.createPayslip({
+      userId: employeeId,
+      month: 11,
+      year: 2026,
+      basicSalary: 50000,
+    });
+
+    await expect(
+      employee.admin.setPayslipPaid({
+        payslipId: (issued.payslip as any).id,
+        paid: true,
+      })
+    ).rejects.toThrow(/Admin access required/);
+  });
+
+  it("rejects marking an unknown payslip", async () => {
+    const admin = appRouter.createCaller(ctxFor(adminId, "admin"));
+
+    await expect(
+      admin.admin.setPayslipPaid({ payslipId: "0123456789abcdef01234567", paid: true })
+    ).rejects.toThrow(/Payslip not found/);
+  });
+
   it("rejects deductions larger than basic salary plus allowances", async () => {
     const admin = appRouter.createCaller(ctxFor(adminId, "admin"));
 

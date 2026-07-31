@@ -656,6 +656,19 @@ export async function upsertPayslip(input: {
   };
 }
 
+/**
+ * Flips a payslip between paid and pending after it was issued. Admins commonly
+ * issue the payslip first and record the payment once the transfer clears.
+ */
+export async function setPayslipPaidStatus(payslipId: string, paid: boolean) {
+  await requireDb();
+  const update = paid ? { paidAt: new Date() } : { $unset: { paidAt: "" } };
+  const saved = await Payslip.findByIdAndUpdate(toObjectId(payslipId), update, {
+    returnDocument: "after",
+  }).lean();
+  return normalizeDoc(saved);
+}
+
 export async function getActiveAnnouncements() {
   if (!(await optionalDb())) return [];
   const now = new Date();
