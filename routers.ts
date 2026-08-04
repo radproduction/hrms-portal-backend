@@ -11,6 +11,12 @@ import { toDataURL } from "qrcode";
 import { emitChatMessage, emitNotification, emitAnnouncement, emitPayslip } from "./_core/realtime";
 import { clockInUser, clockOutUser, WorkClockError } from "./wingman";
 import { computePayslipAmounts, formatPayPeriod } from "./payroll";
+import {
+  getMonthRange,
+  leaveDatesInMonth,
+  localDateKey,
+  summarizeEmployeeMonth,
+} from "./attendance";
 
 export const appRouter = router({
   system: systemRouter,
@@ -1217,6 +1223,98 @@ export const appRouter = router({
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getTimeEntriesByDateRange(input.employeeId, input.startDate, input.endDate);
+      }),
+
+    /**
+     * Monthly attendance, aggregated server-side. Pass employeeId for a single
+     * employee's month, omit it for the whole team.
+     */
+    getMonthlyAttendance: protectedProcedure
+      .input(
+        z.object({
+          month: z.number().int().min(1).max(12),
+          year: z.number().int().min(2000).max(2100),
+          employeeId: z.string().optional(),
+        })
+      )
+      .query(async ({ input, ctx }) => {
+        if (ctx.user.role !== "admin") {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+
+        const { start, end } = getMonthRange(input.month, input.year);
+        const { users, entries, leaves } = await db.getAttendanceReportData(
+          start,
+          end,
+          input.employeeId
+        );
+
+        const entriesByUser = new Map<string, typeof entries>();
+        for (const entry of entries) {
+          const list = entriesByUser.get(entry.userId);
+          if (list) list.push(entry);
+          else entriesByUser.set(entry.userId, [entry]);
+        }
+
+        const leaveDatesByUser = new Map<string, Set<string>>();
+        for (const leave of leaves) {
+          const dates = leaveDatesInMonth(
+            new Date(leave.startDate),
+            new Date(leave.endDate),
+            input.month,
+            input.year
+          );
+          const existing = leaveDatesByUser.get(leave.userId);
+          if (existing) dates.forEach(d => existing.add(d));
+          else leaveDatesByUser.set(leave.userId, dates);
+        }
+
+        const todayKey = localDateKey(new Date());
+
+        const rows = users.map(employee =>
+          summarizeEmployeeMonth({
+            employee,
+            entries: entriesByUser.get(employee.id) ?? [],
+            leaveDates: leaveDatesByUser.get(employee.id) ?? new Set<string>(),
+            month: input.month,
+            year: input.year,
+            todayKey,
+          })
+        );
+
+        const totals = rows.reduce(
+          (acc, row) => ({
+            presentDays: acc.presentDays + row.presentDays,
+            absentDays: acc.absentDays + row.absentDays,
+            leaveDays: acc.leaveDays + row.leaveDays,
+            totalHours: acc.totalHours + row.totalHours,
+            overtimeHours: acc.overtimeHours + row.overtimeHours,
+            missingClockOuts: acc.missingClockOuts + row.missingClockOuts,
+          }),
+          {
+            presentDays: 0,
+            absentDays: 0,
+            leaveDays: 0,
+            totalHours: 0,
+            overtimeHours: 0,
+            missingClockOuts: 0,
+          }
+        );
+
+        return {
+          period: {
+            month: input.month,
+            year: input.year,
+            workingDays: rows[0]?.workingDays ?? 0,
+            workingDaysElapsed: rows[0]?.workingDaysElapsed ?? 0,
+          },
+          rows,
+          totals: {
+            ...totals,
+            totalHours: Math.round(totals.totalHours * 10) / 10,
+            overtimeHours: Math.round(totals.overtimeHours * 10) / 10,
+          },
+        };
       }),
 
     getPayslips: protectedProcedure.query(async ({ ctx }) => {

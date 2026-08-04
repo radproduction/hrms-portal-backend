@@ -1717,6 +1717,61 @@ export async function getTimeEntriesByRangeForAll(startDate: Date, endDate: Date
   return normalizeDocs(entries);
 }
 
+/**
+ * Everything the monthly attendance report needs, in three queries instead of
+ * shipping every time entry and leave in the system to the browser.
+ */
+export async function getAttendanceReportData(
+  startDate: Date,
+  endDate: Date,
+  employeeId?: string
+) {
+  await requireDb();
+
+  const userFilter: Record<string, unknown> = { role: "user" };
+  if (employeeId) userFilter._id = toObjectId(employeeId);
+
+  const users = await User.find(userFilter).sort({ name: 1 }).lean();
+  const userIds = users.map((u: any) => u._id);
+
+  const entries = await TimeEntry.find({
+    userId: { $in: userIds },
+    timeIn: { $gte: startDate, $lte: endDate },
+  })
+    .sort({ timeIn: 1 })
+    .lean();
+
+  // Any approved leave that overlaps the window, not just ones fully inside it.
+  const leaves = await LeaveApplication.find({
+    userId: { $in: userIds },
+    status: "approved",
+    startDate: { $lte: endDate },
+    endDate: { $gte: startDate },
+  }).lean();
+
+  return {
+    users: users.map((u: any) => ({
+      id: String(u._id),
+      name: u.name,
+      employeeId: u.employeeId,
+      department: u.department,
+    })),
+    entries: entries.map((e: any) => ({
+      userId: String(e.userId),
+      timeIn: e.timeIn,
+      timeOut: e.timeOut ?? null,
+      totalHours: e.totalHours ?? null,
+      status: e.status,
+    })),
+    leaves: leaves.map((l: any) => ({
+      userId: String(l.userId),
+      startDate: l.startDate,
+      endDate: l.endDate,
+      leaveType: l.leaveType,
+    })),
+  };
+}
+
 export async function getAllPayslipsWithUsers() {
   await requireDb();
   const payslips = await Payslip.find()
