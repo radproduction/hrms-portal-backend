@@ -3,10 +3,10 @@
 One droplet serves everything from a single domain:
 
 ```
-https://your.domain.com/            → frontend SPA   (nginx, static files)
-https://your.domain.com/api/…       → backend        (proxy → 127.0.0.1:3000)
-https://your.domain.com/uploads/…   → uploaded files (proxy → backend)
-https://your.domain.com/socket.io/  → realtime       (proxy, websocket upgrade)
+https://nowhrms.com/            → frontend SPA   (nginx, static files)
+https://nowhrms.com/api/…       → backend        (proxy → 127.0.0.1:3000)
+https://nowhrms.com/uploads/…   → uploaded files (proxy → backend)
+https://nowhrms.com/socket.io/  → realtime       (proxy, websocket upgrade)
 ```
 
 MongoDB stays on Atlas. Nothing about the database moves.
@@ -38,7 +38,7 @@ Uploads live **outside** the checkout on purpose. `deploy.sh` does a
 
    ```bash
    git clone https://github.com/radproduction/hrms-portal-backend.git /tmp/hrms
-   bash /tmp/hrms/deploy/setup-server.sh your.domain.com
+   bash /tmp/hrms/deploy/setup-server.sh nowhrms.com
    ```
 
    This installs Node 22, nginx, certbot and ufw, clones both repos, creates
@@ -100,7 +100,7 @@ In the browser:
 
 1. Deploy and test on the droplet while Railway/Vercel are still live.
 2. Repoint the Wingman desktop agent at
-   `https://your.domain.com/api/wingman/clock`. The Vercel proxy function
+   `https://nowhrms.com/api/wingman/clock`. The Vercel proxy function
    (`frontend/api/wingman/clock.ts`) has no equivalent here and is not needed —
    the backend has always exposed that route itself.
 3. Move any existing uploads across, if they still exist on the Railway volume:
