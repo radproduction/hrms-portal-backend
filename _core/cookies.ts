@@ -21,28 +21,30 @@ function isSecureRequest(req: Request) {
   return protoList.some(proto => proto.trim().toLowerCase() === "https");
 }
 
+/**
+ * SameSite=None is only needed while the frontend and the API sit on different
+ * origins (Vercel + Railway). It also means the cookie rides along on
+ * cross-site requests, which is what makes CSRF possible here.
+ *
+ * Serving both from one domain lets this be "lax", which removes that exposure
+ * entirely. Set COOKIE_SAMESITE=lax on a single-domain deployment.
+ */
+function resolveSameSite(): "lax" | "strict" | "none" {
+  const raw = (process.env.COOKIE_SAMESITE ?? "").trim().toLowerCase();
+  if (raw === "lax" || raw === "strict" || raw === "none") return raw;
+  return "none";
+}
+
 export function getSessionCookieOptions(
   req: Request
 ): Pick<CookieOptions, "domain" | "httpOnly" | "path" | "sameSite" | "secure"> {
-  // const hostname = req.hostname;
-  // const shouldSetDomain =
-  //   hostname &&
-  //   !LOCAL_HOSTS.has(hostname) &&
-  //   !isIpAddress(hostname) &&
-  //   hostname !== "127.0.0.1" &&
-  //   hostname !== "::1";
-
-  // const domain =
-  //   shouldSetDomain && !hostname.startsWith(".")
-  //     ? `.${hostname}`
-  //     : shouldSetDomain
-  //       ? hostname
-  //       : undefined;
+  const sameSite = resolveSameSite();
 
   return {
     httpOnly: true,
     path: "/",
-    sameSite: "none",
-    secure: isSecureRequest(req),
+    sameSite,
+    // SameSite=None is rejected by browsers without Secure, so it is forced on.
+    secure: sameSite === "none" ? true : isSecureRequest(req),
   };
 }
