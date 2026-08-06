@@ -1,0 +1,50 @@
+# Rad HRMS backend.
+#
+# Install:
+#   sudo cp hrms-backend.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now hrms-backend
+#
+# Logs:
+#   sudo journalctl -u hrms-backend -f
+
+[Unit]
+Description=Rad HRMS backend (Express + tRPC + Socket.IO)
+Documentation=https://github.com/radproduction/hrms-portal-backend
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hrms
+Group=hrms
+WorkingDirectory=/srv/hrms/backend
+
+# Secrets live here, root-owned, chmod 600.
+EnvironmentFile=/srv/hrms/backend/.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node dist/index.js
+
+Restart=always
+RestartSec=5
+# Give up only if it crash-loops hard, so a bad deploy is visible.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hrms-backend
+
+# Hardening. The app only ever writes to the uploads directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hrms/uploads
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
