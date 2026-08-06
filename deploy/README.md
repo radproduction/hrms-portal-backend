@@ -41,9 +41,20 @@ Uploads live **outside** the checkout on purpose. `deploy.sh` does a
    bash /tmp/hrms/deploy/setup-server.sh nowhrms.com
    ```
 
-   This installs Node 22, nginx, certbot and ufw, clones both repos, creates
-   the `hrms` service user, obtains the TLS certificate and installs the
-   systemd unit.
+   This installs Node 22, nginx, certbot and ufw, adds a 2 GB swapfile, clones
+   both repos, creates the `hrms` service user, obtains the TLS certificate and
+   installs the systemd unit.
+
+   The domain is optional. Omit it to provision now and serve over plain HTTP
+   on the droplet IP, then attach the domain later:
+
+   ```bash
+   sudo bash /srv/hrms/backend/deploy/enable-ssl.sh nowhrms.com
+   ```
+
+   `www` is handled automatically when it resolves to the same droplet: it goes
+   into the certificate and is redirected to the bare domain, so the session
+   cookie only ever exists on one host.
 
 4. Create the environment file:
 
