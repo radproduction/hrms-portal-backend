@@ -294,6 +294,99 @@ describe("summarizeEmployeeMonth", () => {
     expect(summary.shortDays).toBe(0);
   });
 
+  it("discards hours from an implausibly long shift but keeps the day present", () => {
+    const summary = summarizeEmployeeMonth({
+      employee,
+      entries: [
+        // Clocked in Friday 24th, clocked out Monday 27th: 73 hours.
+        {
+          userId: "u1",
+          timeIn: new Date("2026-07-24T03:15:00Z"),
+          timeOut: new Date("2026-07-27T04:52:00Z"),
+          totalHours: 73.6,
+          status: "completed",
+        },
+      ],
+      leaveDates: new Set(),
+      month: 7,
+      year: 2026,
+      todayKey: "2026-07-31",
+      offsetMinutes: OFFSET,
+    });
+
+    const day = summary.days.find(d => d.date === "2026-07-24");
+    expect(day?.status).toBe("present");
+    expect(day?.incompleteRecord).toBe(true);
+    expect(day?.hours).toBe(0);
+
+    expect(summary.presentDays).toBe(1);
+    expect(summary.totalHours).toBe(0);
+    expect(summary.overtimeHours).toBe(0);
+    expect(summary.incompleteRecords).toBe(1);
+    // A discarded record must not be reported as a short day either.
+    expect(summary.shortDays).toBe(0);
+  });
+
+  it("keeps a long-but-plausible shift", () => {
+    const summary = summarizeEmployeeMonth({
+      employee,
+      entries: [entryOn("2026-03-02", 13)],
+      leaveDates: new Set(),
+      month: 3,
+      year: 2026,
+      todayKey: "2026-03-31",
+      offsetMinutes: OFFSET,
+    });
+
+    expect(summary.totalHours).toBe(13);
+    expect(summary.overtimeHours).toBe(5);
+    expect(summary.incompleteRecords).toBe(0);
+  });
+
+  it("respects a custom maxShiftHours", () => {
+    const summary = summarizeEmployeeMonth({
+      employee,
+      entries: [entryOn("2026-03-02", 13)],
+      leaveDates: new Set(),
+      month: 3,
+      year: 2026,
+      todayKey: "2026-03-31",
+      offsetMinutes: OFFSET,
+      maxShiftHours: 12,
+    });
+
+    expect(summary.totalHours).toBe(0);
+    expect(summary.incompleteRecords).toBe(1);
+  });
+
+  it("averages over days with usable hours only", () => {
+    const summary = summarizeEmployeeMonth({
+      employee,
+      entries: [
+        entryOn("2026-03-02", 8),
+        entryOn("2026-03-03", 10),
+        // Discarded, must not drag the average toward zero.
+        {
+          userId: "u1",
+          timeIn: new Date("2026-03-04T04:00:00Z"),
+          timeOut: new Date("2026-03-06T04:00:00Z"),
+          totalHours: 48,
+          status: "completed",
+        },
+      ],
+      leaveDates: new Set(),
+      month: 3,
+      year: 2026,
+      todayKey: "2026-03-31",
+      offsetMinutes: OFFSET,
+    });
+
+    expect(summary.presentDays).toBe(3);
+    expect(summary.totalHours).toBe(18);
+    expect(summary.averageHours).toBe(9); // 18 / 2 usable days
+    expect(summary.daysWithUsableHours).toBe(2);
+  });
+
   it("produces a day row for every day of the month", () => {
     const summary = summarizeEmployeeMonth({
       employee,

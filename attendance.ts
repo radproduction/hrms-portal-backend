@@ -21,6 +21,21 @@
 export const FULL_DAY_HOURS = 8;
 export const SHORT_DAY_HOURS = 6.5;
 
+/**
+ * A shift longer than this is treated as an incomplete record rather than real
+ * worked time. In practice people forget to clock out on Friday and clock out
+ * again on Monday, which produced 70+ hour "shifts" and six-figure overtime
+ * totals. The day still counts as attended; only the hours are discarded.
+ */
+function parseMaxShiftHours(): number {
+  const raw = process.env.MAX_SHIFT_HOURS;
+  if (raw === undefined || raw === "") return 14;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 14;
+}
+
+export const MAX_SHIFT_HOURS = parseMaxShiftHours();
+
 function parseOffsetMinutes(): number {
   const raw = process.env.REPORT_UTC_OFFSET_MINUTES;
   if (raw === undefined || raw === "") return 300;
@@ -144,6 +159,8 @@ export type DayRecord = {
   timeOut: string | null;
   hours: number;
   missingClockOut: boolean;
+  /** Clocked in but the shift ran implausibly long, so hours were discarded. */
+  incompleteRecord: boolean;
 };
 
 export type EmployeeMonthSummary = {
@@ -161,18 +178,36 @@ export type EmployeeMonthSummary = {
   overtimeHours: number;
   shortDays: number;
   missingClockOuts: number;
+  /** Days whose hours were discarded because the shift ran implausibly long. */
+  incompleteRecords: number;
+  /** Days counted present that produced usable hours. */
+  daysWithUsableHours: number;
   days: DayRecord[];
 };
 
-function entryHours(entry: RawTimeEntry): number {
+/**
+ * Hours for one entry, plus whether the record looks unusable. Implausibly long
+ * shifts contribute zero hours so they cannot inflate totals or overtime.
+ */
+function entryHours(
+  entry: RawTimeEntry,
+  maxShiftHours = MAX_SHIFT_HOURS
+): { hours: number; incomplete: boolean } {
+  let raw: number | null = null;
+
   if (typeof entry.totalHours === "number" && Number.isFinite(entry.totalHours)) {
-    return entry.totalHours;
+    raw = entry.totalHours;
+  } else if (entry.timeOut) {
+    const inMs = new Date(entry.timeIn).getTime();
+    const outMs = new Date(entry.timeOut).getTime();
+    if (Number.isFinite(inMs) && Number.isFinite(outMs) && outMs > inMs) {
+      raw = (outMs - inMs) / (1000 * 60 * 60);
+    }
   }
-  if (!entry.timeOut) return 0;
-  const inMs = new Date(entry.timeIn).getTime();
-  const outMs = new Date(entry.timeOut).getTime();
-  if (!Number.isFinite(inMs) || !Number.isFinite(outMs) || outMs <= inMs) return 0;
-  return (outMs - inMs) / (1000 * 60 * 60);
+
+  if (raw === null) return { hours: 0, incomplete: false }; // still clocked in
+  if (raw > maxShiftHours) return { hours: 0, incomplete: true };
+  return { hours: raw, incomplete: false };
 }
 
 const round1 = (n: number) => Math.round(n * 10) / 10;
@@ -186,6 +221,7 @@ export function summarizeEmployeeMonth(input: {
   /** "Today" in office-local terms, so future days are not counted absent. */
   todayKey: string;
   offsetMinutes?: number;
+  maxShiftHours?: number;
 }): EmployeeMonthSummary {
   const { employee, entries, leaveDates, month, year, todayKey } = input;
   const offsetMinutes = input.offsetMinutes ?? OFFSET_MINUTES;
@@ -207,8 +243,10 @@ export function summarizeEmployeeMonth(input: {
   let overtimeHours = 0;
   let shortDays = 0;
   let missingClockOuts = 0;
+  let incompleteRecords = 0;
   let workingDays = 0;
   let workingDaysElapsed = 0;
+  const maxShiftHours = input.maxShiftHours ?? MAX_SHIFT_HOURS;
 
   for (const meta of buildMonthDays(month, year)) {
     if (meta.isWorkingDay) workingDays += 1;
@@ -216,7 +254,9 @@ export function summarizeEmployeeMonth(input: {
     if (meta.isWorkingDay && !isFuture) workingDaysElapsed += 1;
 
     const dayEntries = byDate.get(meta.date) ?? [];
-    const dayHours = dayEntries.reduce((sum, e) => sum + entryHours(e), 0);
+    const measured = dayEntries.map(e => entryHours(e, maxShiftHours));
+    const dayHours = measured.reduce((sum, m) => sum + m.hours, 0);
+    const dayIncomplete = measured.filter(m => m.incomplete).length;
     const openEntries = dayEntries.filter(e => !e.timeOut || e.status === "active").length;
 
     let status: DayRecord["status"];
@@ -225,16 +265,18 @@ export function summarizeEmployeeMonth(input: {
       presentDays += 1;
       totalHours += dayHours;
       if (dayHours > FULL_DAY_HOURS) overtimeHours += dayHours - FULL_DAY_HOURS;
-      // Only a working day can fall short; nobody owes hours on a weekend.
+      // Only a working day can fall short, and only when the record is usable.
       if (
         meta.isWorkingDay &&
         openEntries === 0 &&
+        dayIncomplete === 0 &&
         dayHours > 0 &&
         dayHours < SHORT_DAY_HOURS
       ) {
         shortDays += 1;
       }
       missingClockOuts += openEntries;
+      incompleteRecords += dayIncomplete;
     } else if (!meta.isWorkingDay) {
       // A weekend stays a weekend even when a leave range spans it, otherwise
       // the muster roll shows "L" on Sundays.
@@ -267,8 +309,13 @@ export function summarizeEmployeeMonth(input: {
       timeOut: lastOut?.timeOut ? new Date(lastOut.timeOut).toISOString() : null,
       hours: round1(dayHours),
       missingClockOut: openEntries > 0,
+      incompleteRecord: dayIncomplete > 0,
     });
   }
+
+  // Average over days that actually produced hours, so discarded records do not
+  // drag the average down.
+  const daysWithUsableHours = days.filter(d => d.hours > 0).length;
 
   return {
     userId: employee.id,
@@ -281,10 +328,12 @@ export function summarizeEmployeeMonth(input: {
     leaveDays,
     absentDays,
     totalHours: round1(totalHours),
-    averageHours: presentDays > 0 ? round1(totalHours / presentDays) : 0,
+    averageHours: daysWithUsableHours > 0 ? round1(totalHours / daysWithUsableHours) : 0,
     overtimeHours: round1(overtimeHours),
     shortDays,
     missingClockOuts,
+    incompleteRecords,
+    daysWithUsableHours,
     days,
   };
 }
