@@ -22,6 +22,10 @@ export default defineConfig({
     environment: "node",
     include: ["**/*.test.ts"],
     exclude: ["node_modules/**", "dist/**"],
+    // The DB-backed suites share one mongoose connection and one database.
+    // Run files one at a time, otherwise a suite closing the connection in its
+    // afterAll pulls the database out from under whichever file is still going.
+    fileParallelism: false,
     env: {
       MONGODB_URI: testMongoUri,
       JWT_SECRET: process.env.JWT_SECRET ?? "test-secret-not-used-for-real-sessions",

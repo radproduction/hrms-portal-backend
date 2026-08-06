@@ -1,6 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import mongoose from "mongoose";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
+import { User } from "./models";
 import { describeWithDb } from "./test-utils";
 type AuthenticatedUser = NonNullable<TrpcContext["user"]>;
 
@@ -126,15 +128,50 @@ describe("Dashboard", () => {
   });
 });
 
-// Asserts on seeded rows, so it needs a real (throwaway) database.
+// Reads real rows, so it needs a database. It seeds the row it asserts on
+// rather than assuming the database already has one; depending on ambient data
+// made this fail the moment the other suites started cleaning up after
+// themselves.
 describeWithDb("Dashboard (requires database)", () => {
-  it("should return at least one user", async () => {
+  let seededId: string;
+
+  beforeAll(async () => {
+    await mongoose.connect(process.env.MONGODB_URI as string);
+    const created = await User.create({
+      openId: `hrms-test-${Date.now()}`,
+      name: "Seeded User",
+      role: "user",
+      employeeId: `HT${Date.now()}`,
+    });
+    seededId = String(created._id);
+  });
+
+  afterAll(async () => {
+    // Only the seeded row is removed. The connection is shared with the other
+    // suites in this file, so closing it here would break them.
+    if (seededId) await User.deleteMany({ _id: seededId });
+  });
+
+  it("returns the users it can see", async () => {
     const { ctx } = createAuthContext();
     const caller = appRouter.createCaller(ctx);
 
     const result = await caller.dashboard.getUsers();
 
     expect(result.length).toBeGreaterThan(0);
+    expect(result.some((u: any) => u.id === seededId)).toBe(true);
+  });
+
+  it("never exposes password or two-factor fields", async () => {
+    const { ctx } = createAuthContext();
+    const caller = appRouter.createCaller(ctx);
+
+    const result = await caller.dashboard.getUsers();
+
+    for (const user of result as any[]) {
+      expect(user.password).toBeUndefined();
+      expect(user.twoFactorSecret).toBeUndefined();
+    }
   });
 });
 
