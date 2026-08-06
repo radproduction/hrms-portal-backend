@@ -1,0 +1,466 @@
+/**
+ * Flow Project Board API.
+ *
+ * Ported from the Manus reference, with two deliberate differences:
+ *
+ *  - Every id is a string (ObjectId), not an int.
+ *  - Destructive and structural actions are gated. The reference exposed
+ *    deleteColumn, deleteProject and updateProject to any signed-in user, so an
+ *    employee could delete the whole board. Columns and project deletion are
+ *    admin-only; project edits are limited to admins, the creator, or a member.
+ */
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { protectedProcedure, router } from "./_core/trpc";
+import * as fpb from "./fpbDb";
+import { storagePut } from "./storage";
+
+const PRIORITY = z.enum(["low", "medium", "high", "urgent"]);
+const WORK_STATUS = z.enum(["todo", "in_progress", "in_review", "blocked", "done"]);
+const PROJECT_TYPE = z.enum(["dev", "lead", "management", "accounting", "other"]);
+const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid id");
+
+const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
+
+function requireAdmin(ctx: { user: { role?: string } }) {
+  if (ctx.user.role !== "admin") {
+    throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+  }
+}
+
+/** Admins, the creator, or anyone on the project may edit it. */
+async function requireProjectAccess(
+  ctx: { user: { id: string; role?: string } },
+  projectId: string
+) {
+  const project = await fpb.getProject(projectId);
+  if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+  if (ctx.user.role === "admin") return project;
+  const isCreator = String((project as any).createdBy) === ctx.user.id;
+  const isMember = ((project as any).memberIds ?? []).includes(ctx.user.id);
+  if (!isCreator && !isMember) {
+    throw new TRPCError({ code: "FORBIDDEN", message: "You are not on this project" });
+  }
+  return project;
+}
+
+async function projectIdForTask(taskId: string) {
+  const found = await fpb.getTask(taskId);
+  if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+  return String((found.task as any).projectId);
+}
+
+export const fpbRouter = router({
+  // ==================== Board & columns ====================
+
+  getBoard: protectedProcedure.query(async ({ ctx }) => {
+    const board = await fpb.getOrCreateBoard(ctx.user.id);
+    const columns = await fpb.getColumns(board.id!);
+    return { board, columns };
+  }),
+
+  createColumn: protectedProcedure
+    .input(z.object({ name: z.string().min(1).max(100), color: z.string().optional() }))
+    .mutation(async ({ ctx, input }) => {
+      requireAdmin(ctx);
+      const board = await fpb.getOrCreateBoard(ctx.user.id);
+      return fpb.createColumn(board.id!, input.name, input.color);
+    }),
+
+  updateColumn: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        name: z.string().min(1).max(100).optional(),
+        color: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      requireAdmin(ctx);
+      const { id, ...updates } = input;
+      const saved = await fpb.updateColumn(id, updates);
+      if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Column not found" });
+      return saved;
+    }),
+
+  deleteColumn: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      requireAdmin(ctx);
+      try {
+        // Cards are moved to the neighbouring column rather than orphaned.
+        return await fpb.deleteColumn(input.id);
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: error instanceof Error ? error.message : "Could not delete column",
+        });
+      }
+    }),
+
+  reorderColumns: protectedProcedure
+    .input(z.array(z.object({ id: objectId, position: z.number().int().min(0) })))
+    .mutation(async ({ ctx, input }) => {
+      requireAdmin(ctx);
+      await fpb.reorderColumns(input);
+      return { success: true };
+    }),
+
+  // ==================== Projects ====================
+
+  getProjects: protectedProcedure
+    .input(
+      z
+        .object({
+          columnId: objectId.optional(),
+          projectType: PROJECT_TYPE.optional(),
+          status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
+        })
+        .optional()
+    )
+    .query(async ({ ctx, input }) => {
+      const board = await fpb.getOrCreateBoard(ctx.user.id);
+      return fpb.getProjects(board.id!, input);
+    }),
+
+  getProject: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .query(async ({ input }) => {
+      const project = await fpb.getProject(input.id);
+      if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+      return project;
+    }),
+
+  createProject: protectedProcedure
+    .input(
+      z.object({
+        columnId: objectId,
+        title: z.string().min(1).max(255),
+        description: z.string().optional(),
+        projectType: PROJECT_TYPE,
+        priority: PRIORITY.optional(),
+        dueDate: z.date().optional(),
+        memberIds: z.array(objectId).optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      requireAdmin(ctx);
+      const board = await fpb.getOrCreateBoard(ctx.user.id);
+      const project = await fpb.createProject({
+        boardId: board.id!,
+        columnId: input.columnId,
+        title: input.title,
+        description: input.description,
+        projectType: input.projectType,
+        priority: input.priority,
+        dueDate: input.dueDate,
+        createdBy: ctx.user.id,
+        memberIds: input.memberIds,
+      });
+      await fpb.logActivity(project.id!, ctx.user.id, "created project", input.title);
+      return project;
+    }),
+
+  updateProject: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        title: z.string().min(1).max(255).optional(),
+        description: z.string().optional(),
+        columnId: objectId.optional(),
+        projectType: PROJECT_TYPE.optional(),
+        priority: PRIORITY.optional(),
+        status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
+        dueDate: z.date().nullable().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.id);
+      const { id, ...updates } = input;
+      const saved = await fpb.updateProject(id, updates);
+      await fpb.logActivity(id, ctx.user.id, "updated project");
+      return saved;
+    }),
+
+  deleteProject: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      requireAdmin(ctx);
+      await fpb.deleteProject(input.id);
+      return { success: true };
+    }),
+
+  moveProject: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        columnId: objectId,
+        position: z.number().int().min(0),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.id);
+      const moved = await fpb.moveProject(input.id, input.columnId, input.position);
+      if (!moved) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+      await fpb.logActivity(input.id, ctx.user.id, "moved project");
+      return moved;
+    }),
+
+  updateProjectMembers: protectedProcedure
+    .input(z.object({ projectId: objectId, memberIds: z.array(objectId) }))
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      const saved = await fpb.setProjectMembers(input.projectId, input.memberIds);
+      await fpb.logActivity(input.projectId, ctx.user.id, "updated members");
+      return { memberIds: saved };
+    }),
+
+  // ==================== Tasks ====================
+
+  getTasks: protectedProcedure
+    .input(z.object({ projectId: objectId }))
+    .query(async ({ input }) => fpb.getTasks(input.projectId)),
+
+  getTask: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .query(async ({ input }) => {
+      const found = await fpb.getTask(input.id);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      return found;
+    }),
+
+  createTask: protectedProcedure
+    .input(
+      z.object({
+        projectId: objectId,
+        title: z.string().min(1).max(500),
+        description: z.string().optional(),
+        priority: PRIORITY.optional(),
+        dueDate: z.date().optional(),
+        assignedTo: objectId.optional(),
+        memberIds: z.array(objectId).optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      const task = await fpb.createTask({ ...input, createdBy: ctx.user.id });
+      await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title);
+      return task;
+    }),
+
+  updateTask: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        title: z.string().min(1).max(500).optional(),
+        description: z.string().optional(),
+        completed: z.boolean().optional(),
+        status: WORK_STATUS.optional(),
+        progress: z.number().int().min(0).max(100).optional(),
+        priority: PRIORITY.optional(),
+        dueDate: z.date().nullable().optional(),
+        assignedTo: objectId.nullable().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await projectIdForTask(input.id);
+      await requireProjectAccess(ctx, projectId);
+      const { id, ...updates } = input;
+      const saved = await fpb.updateTask(id, updates);
+      await fpb.logActivity(projectId, ctx.user.id, "updated task", saved?.title as string);
+      return saved;
+    }),
+
+  deleteTask: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await projectIdForTask(input.id);
+      await requireProjectAccess(ctx, projectId);
+      await fpb.deleteTask(input.id);
+      await fpb.logActivity(projectId, ctx.user.id, "deleted task");
+      return { success: true };
+    }),
+
+  updateTaskMembers: protectedProcedure
+    .input(z.object({ taskId: objectId, memberIds: z.array(objectId) }))
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await projectIdForTask(input.taskId);
+      await requireProjectAccess(ctx, projectId);
+      const saved = await fpb.setTaskMembers(input.taskId, input.memberIds);
+      return { memberIds: saved };
+    }),
+
+  // ==================== Subtasks ====================
+
+  createSubtask: protectedProcedure
+    .input(z.object({ taskId: objectId, title: z.string().min(1).max(500) }))
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await projectIdForTask(input.taskId);
+      await requireProjectAccess(ctx, projectId);
+      return fpb.createSubtask(input.taskId, input.title);
+    }),
+
+  getSubtask: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .query(async ({ input }) => {
+      const found = await fpb.getSubtask(input.id);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
+      return found;
+    }),
+
+  updateSubtask: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        title: z.string().min(1).max(500).optional(),
+        description: z.string().optional(),
+        completed: z.boolean().optional(),
+        status: WORK_STATUS.optional(),
+        progress: z.number().int().min(0).max(100).optional(),
+        assignedTo: objectId.nullable().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getSubtask(input.id);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
+      const projectId = await projectIdForTask(String((found.subtask as any).taskId));
+      await requireProjectAccess(ctx, projectId);
+      const { id, ...updates } = input;
+      return fpb.updateSubtask(id, updates);
+    }),
+
+  deleteSubtask: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getSubtask(input.id);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
+      const projectId = await projectIdForTask(String((found.subtask as any).taskId));
+      await requireProjectAccess(ctx, projectId);
+      await fpb.deleteSubtask(input.id);
+      return { success: true };
+    }),
+
+  // ==================== Comments ====================
+
+  addTaskComment: protectedProcedure
+    .input(z.object({ taskId: objectId, comment: z.string().min(1).max(5000) }))
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await projectIdForTask(input.taskId);
+      await requireProjectAccess(ctx, projectId);
+      return fpb.addTaskComment(input.taskId, ctx.user.id, input.comment);
+    }),
+
+  deleteTaskComment: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const removed = await fpb.deleteTaskComment(input.id, ctx.user.id);
+      if (!removed) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
+      }
+      return { success: true };
+    }),
+
+  addSubtaskComment: protectedProcedure
+    .input(z.object({ subtaskId: objectId, comment: z.string().min(1).max(5000) }))
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getSubtask(input.subtaskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
+      const projectId = await projectIdForTask(String((found.subtask as any).taskId));
+      await requireProjectAccess(ctx, projectId);
+      return fpb.addSubtaskComment(input.subtaskId, ctx.user.id, input.comment);
+    }),
+
+  deleteSubtaskComment: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const removed = await fpb.deleteSubtaskComment(input.id, ctx.user.id);
+      if (!removed) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
+      }
+      return { success: true };
+    }),
+
+  // ==================== Annotations ====================
+
+  getAnnotations: protectedProcedure
+    .input(z.object({ projectId: objectId }))
+    .query(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      return fpb.getAnnotations(input.projectId);
+    }),
+
+  uploadAnnotation: protectedProcedure
+    .input(
+      z.object({
+        projectId: objectId,
+        fileName: z.string().min(1),
+        fileBase64: z.string().min(1),
+        mimeType: z.string().default("image/jpeg"),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+
+      if (!input.mimeType.startsWith("image/")) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Only images can be annotated" });
+      }
+      const buffer = Buffer.from(input.fileBase64, "base64");
+      if (buffer.length === 0) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "File is empty" });
+      }
+      if (buffer.length > MAX_UPLOAD_BYTES) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "File must be 8MB or smaller" });
+      }
+
+      // The extension is derived from the mime type rather than the supplied
+      // filename, so a client cannot land a .html file under /uploads.
+      const ext = input.mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "img";
+      const key = `fpb-annotations/${input.projectId}/${Date.now()}.${ext}`;
+      const { url } = await storagePut(key, buffer, input.mimeType);
+
+      const annotation = await fpb.createAnnotation({
+        projectId: input.projectId,
+        fileName: input.fileName,
+        fileUrl: url,
+        uploadedBy: ctx.user.id,
+      });
+      await fpb.logActivity(input.projectId, ctx.user.id, "uploaded design file", input.fileName);
+      return annotation;
+    }),
+
+  addAnnotationComment: protectedProcedure
+    .input(
+      z.object({
+        annotationId: objectId,
+        comment: z.string().min(1).max(5000),
+        posX: z.number().min(0).max(100),
+        posY: z.number().min(0).max(100),
+      })
+    )
+    .mutation(async ({ ctx, input }) =>
+      fpb.addAnnotationComment({ ...input, userId: ctx.user.id })
+    ),
+
+  resolveAnnotationComment: protectedProcedure
+    .input(z.object({ id: objectId, resolved: z.boolean() }))
+    .mutation(async ({ input }) => {
+      const saved = await fpb.resolveAnnotationComment(input.id, input.resolved);
+      if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
+      return saved;
+    }),
+
+  deleteAnnotation: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ input }) => {
+      await fpb.deleteAnnotation(input.id);
+      return { success: true };
+    }),
+
+  // ==================== Activity & users ====================
+
+  getActivity: protectedProcedure
+    .input(z.object({ projectId: objectId, limit: z.number().int().min(1).max(100).default(20) }))
+    .query(async ({ input }) => fpb.getActivity(input.projectId, input.limit)),
+
+  getUsers: protectedProcedure.query(async () => fpb.getBoardUsers()),
+});

@@ -17,9 +17,14 @@ import {
   localDateKey,
   summarizeEmployeeMonth,
 } from "./attendance";
+import { fpbRouter } from "./fpbRouter";
 
 export const appRouter = router({
   system: systemRouter,
+
+  // Flow Project Board (Kanban). Separate from the legacy `projects` router
+  // below, which still backs the dashboard, reports and the clock-out flow.
+  fpb: fpbRouter,
   
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
