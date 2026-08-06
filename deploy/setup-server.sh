@@ -51,6 +51,8 @@ mkdir -p "$ROOT" "$UPLOADS"
 chown -R hrms:hrms "$UPLOADS"
 
 echo "==> clone"
+# Guarded so a re-run after a dropped console session picks up where it left off
+# rather than failing on an existing directory.
 [[ -d "$ROOT/backend/.git"  ]] || git clone "$BACKEND_REPO"  "$ROOT/backend"
 [[ -d "$ROOT/frontend/.git" ]] || git clone "$FRONTEND_REPO" "$ROOT/frontend"
 chown -R hrms:hrms "$ROOT"

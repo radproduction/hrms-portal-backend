@@ -44,9 +44,11 @@ fi
 
 log "obtaining certificate"
 # Uses the HTTP site that is already serving, so there is no downtime.
+# --keep-until-expiring makes a re-run a no-op instead of an error, which
+# matters because a dropped console session is a normal way to end up here.
 # shellcheck disable=SC2086
 certbot --nginx -d "$DOMAIN" $WWW_ARG --non-interactive --agree-tos \
-        --register-unsafely-without-email --redirect
+        --register-unsafely-without-email --redirect --keep-until-expiring
 
 log "installing the HTTPS site config"
 install -m 644 "$ROOT/backend/deploy/nginx.conf" /etc/nginx/sites-available/hrms
