@@ -14,6 +14,11 @@ Documentation=https://github.com/radproduction/hrms-portal-backend
 After=network-online.target
 Wants=network-online.target
 
+# These belong to [Unit], not [Service]; systemd ignores them anywhere else.
+# Give up only if it crash-loops hard, so a bad deploy is visible.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
 [Service]
 Type=simple
 User=hrms
@@ -28,9 +33,6 @@ ExecStart=/usr/bin/node dist/index.js
 
 Restart=always
 RestartSec=5
-# Give up only if it crash-loops hard, so a bad deploy is visible.
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
 StandardOutput=journal
 StandardError=journal

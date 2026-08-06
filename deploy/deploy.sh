@@ -37,20 +37,32 @@ sudo -u hrms npm run build --silent
 log "restart backend"
 systemctl restart hrms-backend
 sleep 2
-systemctl is-active --quiet hrms-backend && echo "hrms-backend: active" || {
+systemctl is-active --quiet hrms-backend || {
   echo "hrms-backend FAILED to start:"; journalctl -u hrms-backend -n 40 --no-pager; exit 1;
 }
-
-log "reload nginx"
-nginx -t && systemctl reload nginx
+echo "hrms-backend: active"
 
 log "health check"
-code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/api/trpc/auth.me || true)
-# 401 is the healthy unauthenticated answer; 000 means it never came up.
+# Connecting to Atlas takes a moment, so poll rather than assuming it is ready.
+code=000
+for i in $(seq 1 15); do
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+         http://127.0.0.1:3000/api/trpc/auth.me || echo 000)
+  [[ "$code" != "000" ]] && break
+  sleep 2
+done
+
+# 401 is the healthy unauthenticated answer; 000 means it never listened.
 if [[ "$code" == "000" ]]; then
-  echo "backend did not respond"; journalctl -u hrms-backend -n 40 --no-pager; exit 1
+  echo "backend did not respond after 30s. Recent log:"
+  journalctl -u hrms-backend -n 60 --no-pager
+  exit 1
 fi
 echo "backend responded with HTTP $code"
-journalctl -u hrms-backend -n 5 --no-pager | grep -i uploads || true
+journalctl -u hrms-backend -n 30 --no-pager | grep -Ei 'uploads|mongodb|server running' || true
+
+log "reload nginx"
+# Last, so a broken site config cannot mask a healthy backend.
+nginx -t && systemctl reload nginx
 
 log "done"
