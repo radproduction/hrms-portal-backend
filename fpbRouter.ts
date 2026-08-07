@@ -13,6 +13,8 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { protectedProcedure, router } from "./_core/trpc";
 import * as fpb from "./fpbDb";
+import * as db from "./db";
+import { emitNotification } from "./_core/realtime";
 import { storagePut } from "./storage";
 
 const PRIORITY = z.enum(["low", "medium", "high", "urgent"]);
@@ -42,6 +44,36 @@ async function requireProjectAccess(
     throw new TRPCError({ code: "FORBIDDEN", message: "You are not on this project" });
   }
   return project;
+}
+
+/**
+ * Board changes are only useful if the people affected hear about them, so
+ * assignment and membership raise a notification and a realtime ping. Never
+ * notify the person who performed the action.
+ */
+async function notify(
+  userIds: string[],
+  actorId: string,
+  payload: { title: string; message: string; projectId: string }
+) {
+  const targets = [...new Set(userIds)].filter(id => id && id !== actorId);
+  for (const userId of targets) {
+    try {
+      await db.createNotification({
+        userId,
+        type: "task_assigned",
+        title: payload.title,
+        message: payload.message,
+        priority: "medium",
+        relatedId: payload.projectId,
+        relatedType: "fpb_project",
+      });
+      emitNotification({ userId });
+    } catch (error) {
+      // A failed notification must not roll back the work it describes.
+      console.error("[FPB] failed to notify", userId, error);
+    }
+  }
 }
 
 async function projectIdForTask(taskId: string) {
@@ -158,6 +190,12 @@ export const fpbRouter = router({
         memberIds: input.memberIds,
       });
       await fpb.logActivity(project.id!, ctx.user.id, "created project", input.title);
+
+      await notify(input.memberIds ?? [], ctx.user.id, {
+        title: "Added to a project",
+        message: `You have been added to ${input.title}.`,
+        projectId: project.id!,
+      });
       return project;
     }),
 
@@ -209,9 +247,18 @@ export const fpbRouter = router({
   updateProjectMembers: protectedProcedure
     .input(z.object({ projectId: objectId, memberIds: z.array(objectId) }))
     .mutation(async ({ ctx, input }) => {
-      await requireProjectAccess(ctx, input.projectId);
+      const project = await requireProjectAccess(ctx, input.projectId);
+      const before: string[] = ((project as any).memberIds ?? []) as string[];
       const saved = await fpb.setProjectMembers(input.projectId, input.memberIds);
       await fpb.logActivity(input.projectId, ctx.user.id, "updated members");
+
+      // Only the people who were not already on it.
+      const added = saved.filter(id => !before.includes(id));
+      await notify(added, ctx.user.id, {
+        title: "Added to a project",
+        message: `You have been added to ${(project as any).title}.`,
+        projectId: input.projectId,
+      });
       return { memberIds: saved };
     }),
 
@@ -242,9 +289,19 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      await requireProjectAccess(ctx, input.projectId);
+      const project = await requireProjectAccess(ctx, input.projectId);
       const task = await fpb.createTask({ ...input, createdBy: ctx.user.id });
       await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title);
+
+      await notify(
+        [input.assignedTo ?? "", ...(input.memberIds ?? [])],
+        ctx.user.id,
+        {
+          title: "New task assigned",
+          message: `You have been assigned "${input.title}" in ${(project as any).title}.`,
+          projectId: input.projectId,
+        }
+      );
       return task;
     }),
 
@@ -263,11 +320,24 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const projectId = await projectIdForTask(input.id);
-      await requireProjectAccess(ctx, projectId);
+      const before = await fpb.getTask(input.id);
+      if (!before) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const projectId = String((before.task as any).projectId);
+      const project = await requireProjectAccess(ctx, projectId);
+
       const { id, ...updates } = input;
       const saved = await fpb.updateTask(id, updates);
       await fpb.logActivity(projectId, ctx.user.id, "updated task", saved?.title as string);
+
+      // Only on a genuine change of hands, not on every save.
+      const previous = (before.task as any).assignedTo;
+      if (input.assignedTo && String(previous ?? "") !== input.assignedTo) {
+        await notify([input.assignedTo], ctx.user.id, {
+          title: "Task assigned to you",
+          message: `You have been assigned "${saved?.title}" in ${(project as any).title}.`,
+          projectId,
+        });
+      }
       return saved;
     }),
 

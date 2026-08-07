@@ -394,7 +394,7 @@ export const ProjectTask = model<IProjectTask>('ProjectTask', projectTaskSchema)
 export interface INotification extends Document {
   _id: Types.ObjectId;
   userId: Types.ObjectId;
-  type: 'project_assigned' | 'attendance_issue' | 'hours_shortfall' | 'leave_approved' | 'leave_rejected' | 'announcement' | 'payslip_issued' | 'system_alert';
+  type: 'project_assigned' | 'attendance_issue' | 'hours_shortfall' | 'leave_approved' | 'leave_rejected' | 'announcement' | 'payslip_issued' | 'task_assigned' | 'system_alert';
   title: string;
   message: string;
   priority: 'low' | 'medium' | 'high';
@@ -408,7 +408,7 @@ const notificationSchema = new Schema<INotification>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   type: { 
     type: String, 
-    enum: ['project_assigned', 'attendance_issue', 'hours_shortfall', 'leave_approved', 'leave_rejected', 'announcement', 'payslip_issued', 'system_alert'],
+    enum: ['project_assigned', 'attendance_issue', 'hours_shortfall', 'leave_approved', 'leave_rejected', 'announcement', 'payslip_issued', 'task_assigned', 'system_alert'],
     required: true
   },
   title: { type: String, required: true },

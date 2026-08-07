@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import mongoose from "mongoose";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
-import { User } from "./models";
+import { Notification, User } from "./models";
 import {
   FpbActivity,
   FpbAnnotation,
@@ -74,6 +74,7 @@ describeWithDb("Flow Project Board", () => {
       FpbProject.deleteMany({}),
       FpbColumn.deleteMany({}),
       FpbBoard.deleteMany({}),
+      Notification.deleteMany({ userId: { $in: ids } }),
       User.deleteMany({ _id: { $in: ids } }),
     ]);
     await mongoose.connection.close();
@@ -348,6 +349,69 @@ describeWithDb("Flow Project Board", () => {
     expect(actions).toContain("created project");
     expect(actions).toContain("moved project");
     expect(activity[0].userName).toBe("Board Admin");
+  });
+
+  // ------------------------------------------------------------ notifications
+
+  it("notifies the assignee when a task is created for them", async () => {
+    const project = await newProject("Notify on create", 0, [memberId]);
+    await Notification.deleteMany({ userId: memberId });
+
+    await asAdmin().fpb.createTask({
+      projectId: project.id,
+      title: "Course Details Api",
+      assignedTo: memberId,
+    });
+
+    const notifications = await asMember().notifications.getAll();
+    const hit = notifications.find((n: any) => n.type === "task_assigned");
+    expect(hit).toBeDefined();
+    expect((hit as any).message).toContain("Course Details Api");
+    expect((hit as any).message).toContain("Notify on create");
+  });
+
+  it("notifies on reassignment but not on an unrelated edit", async () => {
+    const project = await newProject("Reassign", 0, [memberId, outsiderId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    await Notification.deleteMany({ userId: memberId });
+
+    await asAdmin().fpb.updateTask({ id: task.id, assignedTo: memberId });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
+
+    // Same assignee, different field: no second ping.
+    await asAdmin().fpb.updateTask({ id: task.id, assignedTo: memberId, priority: "high" });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
+
+    // Only the title changed: still no ping.
+    await asAdmin().fpb.updateTask({ id: task.id, title: "renamed" });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
+  });
+
+  it("notifies people added to the team, and only the new ones", async () => {
+    const project = await newProject("Team pings", 0, [memberId]);
+    await Notification.deleteMany({ userId: { $in: [memberId, outsiderId] } });
+
+    // memberId was already on it; only outsiderId is new.
+    await asAdmin().fpb.updateProjectMembers({
+      projectId: project.id,
+      memberIds: [adminId, memberId, outsiderId],
+    });
+
+    expect(await Notification.countDocuments({ userId: outsiderId, type: "task_assigned" })).toBe(1);
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(0);
+  });
+
+  it("never notifies the person who performed the action", async () => {
+    const project = await newProject("Self assign");
+    await Notification.deleteMany({ userId: adminId });
+
+    await asAdmin().fpb.createTask({
+      projectId: project.id,
+      title: "mine",
+      assignedTo: adminId,
+    });
+
+    expect(await Notification.countDocuments({ userId: adminId, type: "task_assigned" })).toBe(0);
   });
 
   it("rejects a malformed id rather than throwing a cast error", async () => {
