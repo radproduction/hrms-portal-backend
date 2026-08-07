@@ -18,29 +18,13 @@ export type FpbWorkStatus = "todo" | "in_progress" | "in_review" | "blocked" | "
 const PRIORITIES: FpbPriority[] = ["low", "medium", "high", "urgent"];
 const WORK_STATUSES: FpbWorkStatus[] = ["todo", "in_progress", "in_review", "blocked", "done"];
 
-// ==================== Board ====================
-export interface IFpbBoard extends Document {
-  _id: Types.ObjectId;
-  name: string;
-  createdBy: Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const fpbBoardSchema = new Schema<IFpbBoard>(
-  {
-    name: { type: String, required: true },
-    createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
-  },
-  { timestamps: true }
-);
-
-export const FpbBoard = model<IFpbBoard>("FpbBoard", fpbBoardSchema);
-
 // ==================== Column ====================
+// A project owns its own columns, the way a Jira board belongs to one space.
+// Teams run different processes, so one project's board can read
+// Open / Dev / Testing while another reads Marketing / Design / Review.
 export interface IFpbColumn extends Document {
   _id: Types.ObjectId;
-  boardId: Types.ObjectId;
+  projectId: Types.ObjectId;
   name: string;
   color: string;
   position: number;
@@ -50,29 +34,26 @@ export interface IFpbColumn extends Document {
 
 const fpbColumnSchema = new Schema<IFpbColumn>(
   {
-    boardId: { type: Schema.Types.ObjectId, ref: "FpbBoard", required: true },
+    projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
     name: { type: String, required: true },
     color: { type: String, default: "#6366f1" },
     position: { type: Number, default: 0, required: true },
   },
   { timestamps: true }
 );
-fpbColumnSchema.index({ boardId: 1, position: 1 });
+fpbColumnSchema.index({ projectId: 1, position: 1 });
 
 export const FpbColumn = model<IFpbColumn>("FpbColumn", fpbColumnSchema);
 
-// ==================== Project (the draggable card) ====================
+// ==================== Project (a workspace, not a card) ====================
 export interface IFpbProject extends Document {
   _id: Types.ObjectId;
-  boardId: Types.ObjectId;
-  columnId: Types.ObjectId;
   title: string;
   description?: string;
   projectType: FpbProjectType;
   priority: FpbPriority;
   status: "active" | "on_hold" | "completed" | "archived";
   dueDate?: Date;
-  position: number;
   createdBy: Types.ObjectId;
   createdAt: Date;
   updatedAt: Date;
@@ -80,8 +61,6 @@ export interface IFpbProject extends Document {
 
 const fpbProjectSchema = new Schema<IFpbProject>(
   {
-    boardId: { type: Schema.Types.ObjectId, ref: "FpbBoard", required: true },
-    columnId: { type: Schema.Types.ObjectId, ref: "FpbColumn", required: true },
     title: { type: String, required: true },
     description: String,
     projectType: {
@@ -97,12 +76,11 @@ const fpbProjectSchema = new Schema<IFpbProject>(
       default: "active",
     },
     dueDate: Date,
-    position: { type: Number, default: 0, required: true },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
   { timestamps: true }
 );
-fpbProjectSchema.index({ boardId: 1, columnId: 1, position: 1 });
+fpbProjectSchema.index({ status: 1, createdAt: -1 });
 
 export const FpbProject = model<IFpbProject>("FpbProject", fpbProjectSchema);
 
@@ -130,10 +108,12 @@ export const FpbProjectMember = model<IFpbProjectMember>(
   fpbProjectMemberSchema
 );
 
-// ==================== Task ====================
+// ==================== Task (the draggable card) ====================
 export interface IFpbTask extends Document {
   _id: Types.ObjectId;
   projectId: Types.ObjectId;
+  /** Which column of its project's board the card currently sits in. */
+  columnId: Types.ObjectId;
   title: string;
   description?: string;
   completed: boolean;
@@ -151,6 +131,7 @@ export interface IFpbTask extends Document {
 const fpbTaskSchema = new Schema<IFpbTask>(
   {
     projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
+    columnId: { type: Schema.Types.ObjectId, ref: "FpbColumn", required: true },
     title: { type: String, required: true },
     description: String,
     completed: { type: Boolean, default: false, required: true },
@@ -164,7 +145,7 @@ const fpbTaskSchema = new Schema<IFpbTask>(
   },
   { timestamps: true }
 );
-fpbTaskSchema.index({ projectId: 1, position: 1 });
+fpbTaskSchema.index({ projectId: 1, columnId: 1, position: 1 });
 
 export const FpbTask = model<IFpbTask>("FpbTask", fpbTaskSchema);
 

@@ -13,7 +13,6 @@ import {
   FpbActivity,
   FpbAnnotation,
   FpbAnnotationComment,
-  FpbBoard,
   FpbColumn,
   FpbProject,
   FpbProjectMember,
@@ -85,35 +84,21 @@ export const DEFAULT_COLUMNS = [
   { name: "Done", color: "#10b981", position: 4 },
 ];
 
-// ==================== Board & columns ====================
+// ==================== Columns ====================
 
-/** One shared board for the whole company, seeded with the default columns. */
-export async function getOrCreateBoard(userId: string) {
+export async function getColumns(projectId: string) {
   await requireDb();
-  const existing = await FpbBoard.findOne().lean();
-  if (existing) return normalize(existing)!;
-
-  const board = await FpbBoard.create({
-    name: "Flow Project Board",
-    createdBy: toObjectId(userId),
-  });
-  await FpbColumn.insertMany(DEFAULT_COLUMNS.map(c => ({ ...c, boardId: board._id })));
-  return normalize(board)!;
-}
-
-export async function getColumns(boardId: string) {
-  await requireDb();
-  const columns = await FpbColumn.find({ boardId: toObjectId(boardId) })
+  const columns = await FpbColumn.find({ projectId: toObjectId(projectId) })
     .sort({ position: 1 })
     .lean();
   return normalizeAll(columns);
 }
 
-export async function createColumn(boardId: string, name: string, color?: string) {
+export async function createColumn(projectId: string, name: string, color?: string) {
   await requireDb();
-  const count = await FpbColumn.countDocuments({ boardId: toObjectId(boardId) });
+  const count = await FpbColumn.countDocuments({ projectId: toObjectId(projectId) });
   const created = await FpbColumn.create({
-    boardId: toObjectId(boardId),
+    projectId: toObjectId(projectId),
     name,
     color: color ?? "#6366f1",
     position: count,
@@ -133,8 +118,8 @@ export async function updateColumn(id: string, updates: { name?: string; color?:
 }
 
 /**
- * Deleting a column would orphan its cards, so they move to the column on its
- * left (or the first remaining one). The reference left them pointing at a
+ * Deleting a column would orphan its cards, so its tasks move to the column on
+ * its left (or the first remaining one). The reference left them pointing at a
  * column that no longer existed, which made them vanish from the board.
  */
 export async function deleteColumn(id: string) {
@@ -144,7 +129,7 @@ export async function deleteColumn(id: string) {
   if (!column) return { moved: 0, fallbackColumnId: null as string | null };
 
   const siblings = await FpbColumn.find({
-    boardId: column.boardId,
+    projectId: column.projectId,
     _id: { $ne: columnId },
   })
     .sort({ position: 1 })
@@ -157,17 +142,18 @@ export async function deleteColumn(id: string) {
   const before = [...siblings].reverse().find(c => c.position < column.position);
   const fallback = before ?? siblings[0];
 
-  const orphans = await FpbProject.countDocuments({ columnId });
+  const orphans = await FpbTask.countDocuments({ columnId });
   if (orphans > 0) {
-    const tail = await FpbProject.countDocuments({ columnId: fallback._id });
-    const projects = await FpbProject.find({ columnId }).sort({ position: 1 }).lean();
-    let next = tail;
-    for (const p of projects) {
-      await FpbProject.updateOne(
-        { _id: p._id },
-        { columnId: fallback._id, position: next++ }
-      );
-    }
+    let next = await FpbTask.countDocuments({ columnId: fallback._id });
+    const tasks = await FpbTask.find({ columnId }).sort({ position: 1 }).lean();
+    await FpbTask.bulkWrite(
+      tasks.map(t => ({
+        updateOne: {
+          filter: { _id: t._id },
+          update: { columnId: fallback._id, position: next++ },
+        },
+      })) as any
+    );
   }
 
   await FpbColumn.deleteOne({ _id: columnId });
@@ -187,20 +173,16 @@ export async function reorderColumns(items: { id: string; position: number }[]) 
 // ==================== Projects ====================
 
 /**
- * Board cards with their member and task rollups. Three queries total,
- * regardless of how many cards are on the board.
+ * The project list, with member and task rollups. Three queries total,
+ * regardless of how many projects exist.
  */
-export async function getProjects(
-  boardId: string,
-  filters?: { columnId?: string; projectType?: string; status?: string }
-) {
+export async function getProjects(filters?: { projectType?: string; status?: string }) {
   await requireDb();
-  const query: Record<string, unknown> = { boardId: toObjectId(boardId) };
-  if (filters?.columnId) query.columnId = toObjectId(filters.columnId);
+  const query: Record<string, unknown> = {};
   if (filters?.projectType) query.projectType = filters.projectType;
   if (filters?.status) query.status = filters.status;
 
-  const projects = await FpbProject.find(query).sort({ position: 1 }).lean();
+  const projects = await FpbProject.find(query).sort({ createdAt: -1 }).lean();
   if (projects.length === 0) return [];
 
   const ids = projects.map(p => p._id);
@@ -256,9 +238,8 @@ export async function getProject(id: string) {
   return result;
 }
 
+/** Creates a project and seeds it with its own board columns. */
 export async function createProject(input: {
-  boardId: string;
-  columnId: string;
   title: string;
   description?: string;
   projectType: string;
@@ -266,23 +247,28 @@ export async function createProject(input: {
   dueDate?: Date;
   createdBy: string;
   memberIds?: string[];
+  columns?: { name: string; color: string }[];
 }) {
   await requireDb();
-  const boardId = toObjectId(input.boardId);
-  const columnId = toObjectId(input.columnId);
-  const position = await FpbProject.countDocuments({ boardId, columnId });
 
   const project = await FpbProject.create({
-    boardId,
-    columnId,
     title: input.title,
     description: input.description,
     projectType: input.projectType,
     priority: input.priority ?? "medium",
     dueDate: input.dueDate,
-    position,
     createdBy: toObjectId(input.createdBy),
   });
+
+  const columns = input.columns?.length ? input.columns : DEFAULT_COLUMNS;
+  await FpbColumn.insertMany(
+    columns.map((c, position) => ({
+      projectId: project._id,
+      name: c.name,
+      color: c.color,
+      position,
+    }))
+  );
 
   // The creator is always a member, plus anyone picked in the dialog.
   const memberIds = new Set<string>([input.createdBy, ...(input.memberIds ?? [])]);
@@ -326,6 +312,7 @@ export async function deleteProject(id: string) {
   ]);
   await Promise.all([
     FpbTask.deleteMany({ projectId }),
+    FpbColumn.deleteMany({ projectId }),
     FpbProjectMember.deleteMany({ projectId }),
     FpbAnnotation.deleteMany({ projectId }),
     FpbActivity.deleteMany({ projectId }),
@@ -338,16 +325,22 @@ export async function deleteProject(id: string) {
  * The reference wrote the dropped index straight onto one row, which left
  * duplicate positions and made card order drift after a few moves.
  */
-export async function moveProject(id: string, columnId: string, position: number) {
+export async function moveTask(id: string, columnId: string, position: number) {
   await requireDb();
-  const projectId = toObjectId(id);
+  const taskId = toObjectId(id);
   const target = toObjectId(columnId);
 
-  const project = await FpbProject.findById(projectId).lean();
-  if (!project) return null;
+  const task = await FpbTask.findById(taskId).lean();
+  if (!task) return null;
+
+  const column = await FpbColumn.findById(target).lean();
+  // A card can only move between columns of its own project's board.
+  if (!column || String(column.projectId) !== String(task.projectId)) {
+    throw new Error("Column does not belong to this project");
+  }
 
   // Both ids are compared and written as strings; Mongoose casts on the way in.
-  const from = String(project.columnId);
+  const from = String(task.columnId);
   const sameColumn = from === target;
 
   type PositionWrite = {
@@ -357,34 +350,34 @@ export async function moveProject(id: string, columnId: string, position: number
     };
   };
 
-  const destination = (await FpbProject.find({ columnId: target }).sort({ position: 1 }).lean())
-    .filter(p => String(p._id) !== id);
+  const destination = (await FpbTask.find({ columnId: target }).sort({ position: 1 }).lean())
+    .filter(t => String(t._id) !== id);
 
   const clamped = Math.max(0, Math.min(position, destination.length));
-  destination.splice(clamped, 0, { ...project, columnId: target } as any);
+  destination.splice(clamped, 0, { ...task, columnId: target } as any);
 
-  const writes: PositionWrite[] = destination.map((p, index) => ({
+  const writes: PositionWrite[] = destination.map((t, index) => ({
     updateOne: {
-      filter: { _id: p._id },
+      filter: { _id: t._id },
       update: { columnId: target, position: index },
     },
   }));
 
   if (!sameColumn) {
-    const source = (await FpbProject.find({ columnId: from }).sort({ position: 1 }).lean())
-      .filter(p => String(p._id) !== id);
+    const source = (await FpbTask.find({ columnId: from }).sort({ position: 1 }).lean())
+      .filter(t => String(t._id) !== id);
     writes.push(
-      ...source.map((p, index) => ({
+      ...source.map((t, index) => ({
         updateOne: {
-          filter: { _id: p._id },
+          filter: { _id: t._id },
           update: { columnId: from, position: index },
         },
       }))
     );
   }
 
-  if (writes.length > 0) await FpbProject.bulkWrite(writes as any);
-  return normalize(await FpbProject.findById(projectId).lean());
+  if (writes.length > 0) await FpbTask.bulkWrite(writes as any);
+  return normalize(await FpbTask.findById(taskId).lean());
 }
 
 export async function setProjectMembers(projectId: string, memberIds: string[]) {
@@ -433,7 +426,7 @@ async function syncCompletion(
 export async function getTasks(projectId: string) {
   await requireDb();
   const tasks = await FpbTask.find({ projectId: toObjectId(projectId) })
-    .sort({ position: 1 })
+    .sort({ columnId: 1, position: 1 })
     .lean();
   if (tasks.length === 0) return [];
 
@@ -488,6 +481,7 @@ export async function getTask(id: string) {
 
 export async function createTask(input: {
   projectId: string;
+  columnId?: string;
   title: string;
   description?: string;
   priority?: string;
@@ -498,10 +492,20 @@ export async function createTask(input: {
 }) {
   await requireDb();
   const projectId = toObjectId(input.projectId);
-  const position = await FpbTask.countDocuments({ projectId });
+
+  // Default to the first column, so a card always lands somewhere on the board.
+  let columnId = input.columnId;
+  if (!columnId) {
+    const first = await FpbColumn.findOne({ projectId }).sort({ position: 1 }).lean();
+    if (!first) throw new Error("This project has no columns yet");
+    columnId = String(first._id);
+  }
+
+  const position = await FpbTask.countDocuments({ projectId, columnId: toObjectId(columnId) });
 
   const task = await FpbTask.create({
     projectId,
+    columnId: toObjectId(columnId),
     title: input.title,
     description: input.description,
     priority: input.priority ?? "medium",

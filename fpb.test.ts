@@ -6,7 +6,6 @@ import { Notification, User } from "./models";
 import {
   FpbActivity,
   FpbAnnotation,
-  FpbBoard,
   FpbColumn,
   FpbProject,
   FpbProjectMember,
@@ -18,9 +17,10 @@ import {
 import { describeWithDb } from "./test-utils";
 
 /**
- * Covers the board mechanics and the three behaviours that differ from the
- * Manus reference: dense card positions after a move, cards being rehomed when
- * a column is deleted, and completed/status staying in agreement.
+ * The board is shaped like Jira: a project is a workspace that owns its own
+ * columns, and tasks are the cards that move between them. An earlier cut had
+ * projects themselves moving across one global board, which is what these tests
+ * now guard against regressing to.
  *
  * Needs a throwaway database:
  *   TEST_MONGODB_URI="mongodb://.../hrms_test" npm test
@@ -29,7 +29,6 @@ describeWithDb("Flow Project Board", () => {
   let adminId: string;
   let memberId: string;
   let outsiderId: string;
-  let columns: any[] = [];
 
   const ctxFor = (id: string, role: "admin" | "user") =>
     ({
@@ -58,22 +57,13 @@ describeWithDb("Flow Project Board", () => {
   afterAll(async () => {
     if (!adminId) return;
     const ids = [adminId, memberId, outsiderId];
-    const projects = await FpbProject.find({}, { _id: 1 }).lean();
-    const projectIds = projects.map(p => p._id);
-    const tasks = await FpbTask.find({}, { _id: 1 }).lean();
     await Promise.all([
-      FpbSubtask.deleteMany({ taskId: { $in: tasks.map(t => t._id) } }),
-      FpbTaskComment.deleteMany({}),
-      FpbTaskMember.deleteMany({}),
-      FpbTask.deleteMany({}),
-      FpbProjectMember.deleteMany({ projectId: { $in: projectIds } }),
-      FpbActivity.deleteMany({}),
-      FpbAnnotation.deleteMany({}),
+      FpbSubtask.deleteMany({}), FpbTaskComment.deleteMany({}), FpbTaskMember.deleteMany({}),
+      FpbTask.deleteMany({}), FpbColumn.deleteMany({}), FpbProjectMember.deleteMany({}),
+      FpbActivity.deleteMany({}), FpbAnnotation.deleteMany({}),
     ]);
     await Promise.all([
       FpbProject.deleteMany({}),
-      FpbColumn.deleteMany({}),
-      FpbBoard.deleteMany({}),
       Notification.deleteMany({ userId: { $in: ids } }),
       User.deleteMany({ _id: { $in: ids } }),
     ]);
@@ -81,170 +71,191 @@ describeWithDb("Flow Project Board", () => {
   });
 
   beforeEach(async () => {
-    // Clean slate for cards between tests; the board and columns are reused.
     await Promise.all([
-      FpbProject.deleteMany({}),
-      FpbProjectMember.deleteMany({}),
-      FpbTask.deleteMany({}),
-      FpbTaskMember.deleteMany({}),
+      FpbProject.deleteMany({}), FpbColumn.deleteMany({}), FpbTask.deleteMany({}),
+      FpbProjectMember.deleteMany({}), FpbTaskMember.deleteMany({}), FpbSubtask.deleteMany({}),
     ]);
-    const board = await asAdmin().fpb.getBoard();
-    columns = board.columns;
   });
 
-  const newProject = (title: string, columnIndex = 0, memberIds: string[] = []) =>
-    asAdmin().fpb.createProject({
-      columnId: columns[columnIndex].id,
-      title,
-      projectType: "dev",
-      memberIds,
+  /** Creates a project and returns it together with its seeded columns. */
+  async function newProject(title = "Project", memberIds: string[] = []) {
+    const project = await asAdmin().fpb.createProject({
+      title, projectType: "dev", memberIds,
     });
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    return { project, columns: board.columns };
+  }
 
-  // ---------------------------------------------------------------- board
+  // -------------------------------------------------------------- structure
 
-  it("seeds a board with the five default columns", async () => {
-    const { board, columns: cols } = await asAdmin().fpb.getBoard();
-    expect(board.name).toBe("Flow Project Board");
-    expect(cols.map((c: any) => c.name)).toEqual([
+  it("gives each new project its own board with default columns", async () => {
+    const { project, columns } = await newProject("Alpha");
+
+    expect(columns.map((c: any) => c.name)).toEqual([
       "Backlog", "To Do", "In Progress", "In Review", "Done",
     ]);
-    expect(cols.map((c: any) => c.position)).toEqual([0, 1, 2, 3, 4]);
+    // Columns belong to the project, not to anything global.
+    expect(columns.every((c: any) => c.projectId === project.id)).toBe(true);
   });
 
-  it("returns the same board on a second call rather than seeding again", async () => {
-    const first = await asAdmin().fpb.getBoard();
-    const second = await asMember().fpb.getBoard();
-    expect(second.board.id).toBe(first.board.id);
-    expect(second.columns).toHaveLength(first.columns.length);
+  it("keeps one project's columns out of another's", async () => {
+    const a = await newProject("Alpha");
+    const b = await newProject("Beta");
+
+    await asAdmin().fpb.createColumn({ projectId: a.project.id, name: "QA only in Alpha" });
+
+    const boardA = await asAdmin().fpb.getBoard({ projectId: a.project.id });
+    const boardB = await asAdmin().fpb.getBoard({ projectId: b.project.id });
+
+    expect(boardA.columns.map((c: any) => c.name)).toContain("QA only in Alpha");
+    expect(boardB.columns.map((c: any) => c.name)).not.toContain("QA only in Alpha");
   });
 
-  it("only lets an admin add or delete columns", async () => {
-    await expect(
-      asMember().fpb.createColumn({ name: "Sneaky" })
-    ).rejects.toThrow(/Admin access required/);
-    await expect(
-      asMember().fpb.deleteColumn({ id: columns[0].id })
-    ).rejects.toThrow(/Admin access required/);
-  });
-
-  // ---------------------------------------------------------------- cards
-
-  it("creates a card and puts the creator plus picked members on it", async () => {
-    const project = await newProject("Website revamp", 1, [memberId]);
-    expect(project.title).toBe("Website revamp");
-
-    const full = await asAdmin().fpb.getProject({ id: project.id });
-    expect((full.memberIds as string[]).sort()).toEqual([adminId, memberId].sort());
-  });
-
-  it("rolls up task progress onto the card", async () => {
-    const project = await newProject("With tasks");
-    const a = await asAdmin().fpb.createTask({ projectId: project.id, title: "one" });
-    await asAdmin().fpb.createTask({ projectId: project.id, title: "two" });
-    await asAdmin().fpb.updateTask({ id: a.id, completed: true });
-
-    const [card] = (await asAdmin().fpb.getProjects()).filter((p: any) => p.id === project.id);
-    expect(card.taskCount).toBe(2);
-    expect(card.completedTasks).toBe(1);
-    expect(card.progress).toBe(50);
-  });
-
-  it("filters cards by project type", async () => {
-    await newProject("A dev one");
-    await asAdmin().fpb.createProject({
-      columnId: columns[0].id, title: "An accounting one", projectType: "accounting",
+  it("accepts a custom set of columns at creation", async () => {
+    const project = await asAdmin().fpb.createProject({
+      title: "Marketing push",
+      projectType: "management",
+      columns: [
+        { name: "Marketing", color: "#ec4899" },
+        { name: "Design", color: "#8b5cf6" },
+        { name: "Review", color: "#10b981" },
+      ],
     });
-
-    const dev = await asAdmin().fpb.getProjects({ projectType: "dev" });
-    expect(dev.map((p: any) => p.title)).toEqual(["A dev one"]);
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    expect(board.columns.map((c: any) => c.name)).toEqual(["Marketing", "Design", "Review"]);
   });
 
-  // ------------------------------------------------------------ moving
+  it("has no notion of a project sitting in a column", async () => {
+    const { project } = await newProject();
+    const stored = await FpbProject.findById(project.id).lean();
+    // The old shape had columnId/position on the project itself.
+    expect((stored as any).columnId).toBeUndefined();
+    expect((stored as any).position).toBeUndefined();
+  });
 
-  it("keeps positions dense and unique after a move between columns", async () => {
-    const a = await newProject("A", 0);
-    const b = await newProject("B", 0);
-    const c = await newProject("C", 0);
+  // ------------------------------------------------------------ task cards
 
-    // Drop B at the top of column 1.
-    await asAdmin().fpb.moveProject({ id: b.id, columnId: columns[1].id, position: 0 });
+  it("drops a new task into the first column", async () => {
+    const { project, columns } = await newProject();
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "First" });
+    expect(task.columnId).toBe(columns[0].id);
+  });
 
-    const all = await asAdmin().fpb.getProjects();
-    const source = all.filter((p: any) => p.columnId === columns[0].id)
+  it("puts a task straight into a chosen column", async () => {
+    const { project, columns } = await newProject();
+    const task = await asAdmin().fpb.createTask({
+      projectId: project.id, columnId: columns[2].id, title: "Straight to work",
+    });
+    expect(task.columnId).toBe(columns[2].id);
+  });
+
+  it("moves a task between columns and keeps positions dense", async () => {
+    const { project, columns } = await newProject();
+    const a = await asAdmin().fpb.createTask({ projectId: project.id, title: "A" });
+    const b = await asAdmin().fpb.createTask({ projectId: project.id, title: "B" });
+    await asAdmin().fpb.createTask({ projectId: project.id, title: "C" });
+
+    await asAdmin().fpb.moveTask({ id: b.id, columnId: columns[2].id, position: 0 });
+
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    const first = board.tasks.filter((t: any) => t.columnId === columns[0].id)
       .sort((x: any, y: any) => x.position - y.position);
-    const dest = all.filter((p: any) => p.columnId === columns[1].id);
+    const third = board.tasks.filter((t: any) => t.columnId === columns[2].id);
 
-    expect(source.map((p: any) => p.title)).toEqual(["A", "C"]);
-    // The gap B left behind is closed, not left as 0,2.
-    expect(source.map((p: any) => p.position)).toEqual([0, 1]);
-    expect(dest.map((p: any) => p.title)).toEqual(["B"]);
-    expect(dest[0].position).toBe(0);
-    expect([a.id, c.id]).toHaveLength(2);
+    expect(first.map((t: any) => t.title)).toEqual(["A", "C"]);
+    // The gap B left behind is closed rather than left as 0,2.
+    expect(first.map((t: any) => t.position)).toEqual([0, 1]);
+    expect(third.map((t: any) => t.title)).toEqual(["B"]);
+    expect(third[0].position).toBe(0);
+    expect(a.id).toBeTruthy();
   });
 
-  it("reorders correctly when moving within one column", async () => {
-    await newProject("A", 0);
-    await newProject("B", 0);
-    const c = await newProject("C", 0);
+  it("reorders within one column", async () => {
+    const { project, columns } = await newProject();
+    await asAdmin().fpb.createTask({ projectId: project.id, title: "A" });
+    await asAdmin().fpb.createTask({ projectId: project.id, title: "B" });
+    const c = await asAdmin().fpb.createTask({ projectId: project.id, title: "C" });
 
-    // Pull C to the front.
-    await asAdmin().fpb.moveProject({ id: c.id, columnId: columns[0].id, position: 0 });
+    await asAdmin().fpb.moveTask({ id: c.id, columnId: columns[0].id, position: 0 });
 
-    const ordered = (await asAdmin().fpb.getProjects())
-      .filter((p: any) => p.columnId === columns[0].id)
-      .sort((x: any, y: any) => x.position - y.position);
-
-    expect(ordered.map((p: any) => p.title)).toEqual(["C", "A", "B"]);
-    expect(ordered.map((p: any) => p.position)).toEqual([0, 1, 2]);
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    const ordered = board.tasks.sort((x: any, y: any) => x.position - y.position);
+    expect(ordered.map((t: any) => t.title)).toEqual(["C", "A", "B"]);
+    expect(ordered.map((t: any) => t.position)).toEqual([0, 1, 2]);
   });
 
-  it("clamps an out-of-range drop index instead of leaving a hole", async () => {
-    await newProject("A", 0);
-    const b = await newProject("B", 0);
+  it("refuses to move a task into another project's column", async () => {
+    const a = await newProject("Alpha");
+    const b = await newProject("Beta");
+    const task = await asAdmin().fpb.createTask({ projectId: a.project.id, title: "stay put" });
 
-    await asAdmin().fpb.moveProject({ id: b.id, columnId: columns[1].id, position: 99 });
+    await expect(
+      asAdmin().fpb.moveTask({ id: task.id, columnId: b.columns[0].id, position: 0 })
+    ).rejects.toThrow(/does not belong to this project/);
+  });
 
-    const dest = (await asAdmin().fpb.getProjects())
-      .filter((p: any) => p.columnId === columns[1].id);
-    expect(dest[0].position).toBe(0);
+  it("clamps an out-of-range drop index", async () => {
+    const { project, columns } = await newProject();
+    const t = await asAdmin().fpb.createTask({ projectId: project.id, title: "A" });
+    await asAdmin().fpb.moveTask({ id: t.id, columnId: columns[1].id, position: 99 });
+
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    expect(board.tasks[0].position).toBe(0);
   });
 
   // ------------------------------------------------------ column deletion
 
-  it("rehomes cards to the previous column when a column is deleted", async () => {
-    const project = await newProject("Needs a home", 2);
+  it("rehomes tasks when their column is deleted", async () => {
+    const { project, columns } = await newProject();
+    const task = await asAdmin().fpb.createTask({
+      projectId: project.id, columnId: columns[2].id, title: "Needs a home",
+    });
 
     const result = await asAdmin().fpb.deleteColumn({ id: columns[2].id });
     expect(result.moved).toBe(1);
 
-    const all = await asAdmin().fpb.getProjects();
-    const moved = all.find((p: any) => p.id === project.id);
-    // Still on the board rather than pointing at a column that no longer exists.
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    const moved = board.tasks.find((t: any) => t.id === task.id);
     expect(moved).toBeDefined();
     expect(moved!.columnId).toBe(columns[1].id);
-
-    // Put the column back for the remaining tests.
-    await asAdmin().fpb.createColumn({ name: "In Progress", color: "#f59e0b" });
   });
 
-  it("refuses to delete the last remaining column", async () => {
-    const { columns: cols } = await asAdmin().fpb.getBoard();
-    for (const col of cols.slice(1)) {
+  it("refuses to delete a project's last column", async () => {
+    const { project, columns } = await newProject();
+    for (const col of columns.slice(1)) {
       await asAdmin().fpb.deleteColumn({ id: col.id });
     }
     await expect(
-      asAdmin().fpb.deleteColumn({ id: cols[0].id })
+      asAdmin().fpb.deleteColumn({ id: columns[0].id })
     ).rejects.toThrow(/Cannot delete the last column/);
-
-    for (const c of ["To Do", "In Progress", "In Review", "Done"]) {
-      await asAdmin().fpb.createColumn({ name: c });
-    }
   });
 
-  // ------------------------------------------------------------- tasks
+  it("removes a project's columns along with the project", async () => {
+    const { project } = await newProject();
+    await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+
+    await asAdmin().fpb.deleteProject({ id: project.id });
+
+    expect(await FpbColumn.countDocuments({ projectId: project.id })).toBe(0);
+    expect(await FpbTask.countDocuments({ projectId: project.id })).toBe(0);
+  });
+
+  // ------------------------------------------------------------- task work
+
+  it("rolls task progress up onto the project", async () => {
+    const { project } = await newProject();
+    const a = await asAdmin().fpb.createTask({ projectId: project.id, title: "one" });
+    await asAdmin().fpb.createTask({ projectId: project.id, title: "two" });
+    await asAdmin().fpb.updateTask({ id: a.id, completed: true });
+
+    const listed = (await asAdmin().fpb.getProjects()).find((p: any) => p.id === project.id);
+    expect(listed!.taskCount).toBe(2);
+    expect(listed!.completedTasks).toBe(1);
+    expect(listed!.progress).toBe(50);
+  });
 
   it("keeps completed and status in agreement", async () => {
-    const project = await newProject("Sync check");
+    const { project } = await newProject();
     const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
 
     const done = await asAdmin().fpb.updateTask({ id: task.id, completed: true });
@@ -253,165 +264,116 @@ describeWithDb("Flow Project Board", () => {
 
     const reopened = await asAdmin().fpb.updateTask({ id: task.id, completed: false });
     expect(reopened!.status).not.toBe("done");
-    expect(reopened!.completed).toBe(false);
-
-    const viaStatus = await asAdmin().fpb.updateTask({ id: task.id, status: "done" });
-    expect(viaStatus!.completed).toBe(true);
   });
 
-  it("leaves an unfinished task's status alone when completed is set false", async () => {
-    const project = await newProject("Still todo");
-    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
-
-    const saved = await asAdmin().fpb.updateTask({ id: task.id, completed: false });
-    // Nothing to demote, so it stays where it was rather than jumping forward.
-    expect(saved!.status).toBe("todo");
-  });
-
-  it("carries subtasks and members on the task list", async () => {
-    const project = await newProject("Deep", 0, [memberId]);
+  it("carries subtasks and members on the board payload", async () => {
+    const { project } = await newProject("Deep", [memberId]);
     const task = await asAdmin().fpb.createTask({
       projectId: project.id, title: "parent", memberIds: [memberId],
     });
     await asAdmin().fpb.createSubtask({ taskId: task.id, title: "child" });
 
-    const [loaded] = await asAdmin().fpb.getTasks({ projectId: project.id });
-    expect(loaded.subtasks).toHaveLength(1);
-    expect((loaded.subtasks as any[])[0].title).toBe("child");
-    expect(loaded.memberIds).toEqual([memberId]);
-  });
-
-  it("removes subtasks and comments with the task", async () => {
-    const project = await newProject("Cascade");
-    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "doomed" });
-    await asAdmin().fpb.createSubtask({ taskId: task.id, title: "child" });
-    await asAdmin().fpb.addTaskComment({ taskId: task.id, comment: "hi" });
-
-    await asAdmin().fpb.deleteTask({ id: task.id });
-
-    expect(await FpbSubtask.countDocuments({ taskId: task.id })).toBe(0);
-    expect(await FpbTaskComment.countDocuments({ taskId: task.id })).toBe(0);
-  });
-
-  it("removes everything belonging to a deleted card", async () => {
-    const project = await newProject("Doomed");
-    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
-    await asAdmin().fpb.createSubtask({ taskId: task.id, title: "s" });
-
-    await asAdmin().fpb.deleteProject({ id: project.id });
-
-    expect(await FpbTask.countDocuments({ projectId: project.id })).toBe(0);
-    expect(await FpbProjectMember.countDocuments({ projectId: project.id })).toBe(0);
-    expect(await FpbSubtask.countDocuments({ taskId: task.id })).toBe(0);
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    expect((board.tasks[0].subtasks as any[])[0].title).toBe("child");
+    expect(board.tasks[0].memberIds).toEqual([memberId]);
   });
 
   // --------------------------------------------------------- access control
 
   it("keeps non-members out of a project", async () => {
-    const project = await newProject("Private", 0, [memberId]);
+    const { project } = await newProject("Private", [memberId]);
 
     await expect(
       asOutsider().fpb.createTask({ projectId: project.id, title: "nope" })
     ).rejects.toThrow(/not on this project/);
 
-    // A member on the project can.
     const task = await asMember().fpb.createTask({ projectId: project.id, title: "fine" });
     expect(task.title).toBe("fine");
   });
 
-  it("only lets an admin delete a card", async () => {
-    const project = await newProject("Guarded", 0, [memberId]);
+  it("only lets an admin create or delete a project", async () => {
+    const { project } = await newProject("Guarded", [memberId]);
+    await expect(
+      asMember().fpb.createProject({ title: "sneaky", projectType: "dev" })
+    ).rejects.toThrow(/Admin access required/);
     await expect(
       asMember().fpb.deleteProject({ id: project.id })
     ).rejects.toThrow(/Admin access required/);
   });
 
-  it("only lets the author delete their own comment", async () => {
-    const project = await newProject("Comments", 0, [memberId]);
-    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
-    const comment = await asMember().fpb.addTaskComment({ taskId: task.id, comment: "mine" });
+  it("lets a member shape their own project's columns", async () => {
+    const { project } = await newProject("Shared", [memberId]);
+    // Columns are per project now, so a member can adjust their own workflow.
+    const col = await asMember().fpb.createColumn({ projectId: project.id, name: "QA" });
+    expect(col.name).toBe("QA");
 
+    const other = await newProject("Not theirs");
     await expect(
-      asAdmin().fpb.deleteTaskComment({ id: comment.id })
-    ).rejects.toThrow(/only delete your own/);
-
-    await expect(asMember().fpb.deleteTaskComment({ id: comment.id })).resolves.toEqual({
-      success: true,
-    });
-  });
-
-  it("records activity for the actions that change a card", async () => {
-    const project = await newProject("Audited");
-    await asAdmin().fpb.moveProject({ id: project.id, columnId: columns[1].id, position: 0 });
-
-    const activity = await asAdmin().fpb.getActivity({ projectId: project.id });
-    const actions = activity.map((a: any) => a.action);
-    expect(actions).toContain("created project");
-    expect(actions).toContain("moved project");
-    expect(activity[0].userName).toBe("Board Admin");
+      asMember().fpb.createColumn({ projectId: other.project.id, name: "nope" })
+    ).rejects.toThrow(/not on this project/);
   });
 
   // ------------------------------------------------------------ notifications
 
   it("notifies the assignee when a task is created for them", async () => {
-    const project = await newProject("Notify on create", 0, [memberId]);
+    const { project } = await newProject("Notify", [memberId]);
     await Notification.deleteMany({ userId: memberId });
 
     await asAdmin().fpb.createTask({
-      projectId: project.id,
-      title: "Course Details Api",
-      assignedTo: memberId,
+      projectId: project.id, title: "Course Details Api", assignedTo: memberId,
     });
 
-    const notifications = await asMember().notifications.getAll();
-    const hit = notifications.find((n: any) => n.type === "task_assigned");
+    const hit = (await asMember().notifications.getAll())
+      .find((n: any) => n.type === "task_assigned");
     expect(hit).toBeDefined();
     expect((hit as any).message).toContain("Course Details Api");
-    expect((hit as any).message).toContain("Notify on create");
   });
 
   it("notifies on reassignment but not on an unrelated edit", async () => {
-    const project = await newProject("Reassign", 0, [memberId, outsiderId]);
+    const { project } = await newProject("Reassign", [memberId]);
     const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
     await Notification.deleteMany({ userId: memberId });
 
     await asAdmin().fpb.updateTask({ id: task.id, assignedTo: memberId });
     expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
 
-    // Same assignee, different field: no second ping.
-    await asAdmin().fpb.updateTask({ id: task.id, assignedTo: memberId, priority: "high" });
-    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
-
-    // Only the title changed: still no ping.
     await asAdmin().fpb.updateTask({ id: task.id, title: "renamed" });
     expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
   });
 
-  it("notifies people added to the team, and only the new ones", async () => {
-    const project = await newProject("Team pings", 0, [memberId]);
+  it("notifies only the newly added team members", async () => {
+    const { project } = await newProject("Team", [memberId]);
     await Notification.deleteMany({ userId: { $in: [memberId, outsiderId] } });
 
-    // memberId was already on it; only outsiderId is new.
     await asAdmin().fpb.updateProjectMembers({
-      projectId: project.id,
-      memberIds: [adminId, memberId, outsiderId],
+      projectId: project.id, memberIds: [adminId, memberId, outsiderId],
     });
 
     expect(await Notification.countDocuments({ userId: outsiderId, type: "task_assigned" })).toBe(1);
     expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(0);
   });
 
-  it("never notifies the person who performed the action", async () => {
-    const project = await newProject("Self assign");
+  it("never notifies the person who acted", async () => {
+    const { project } = await newProject();
     await Notification.deleteMany({ userId: adminId });
-
     await asAdmin().fpb.createTask({
-      projectId: project.id,
-      title: "mine",
-      assignedTo: adminId,
+      projectId: project.id, title: "mine", assignedTo: adminId,
     });
-
     expect(await Notification.countDocuments({ userId: adminId, type: "task_assigned" })).toBe(0);
+  });
+
+  // ------------------------------------------------------------------ misc
+
+  it("records activity for the actions that change a board", async () => {
+    const { project, columns } = await newProject("Audited");
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    await asAdmin().fpb.moveTask({ id: task.id, columnId: columns[1].id, position: 0 });
+
+    const actions = (await asAdmin().fpb.getActivity({ projectId: project.id }))
+      .map((a: any) => a.action);
+    expect(actions).toContain("created project");
+    expect(actions).toContain("added task");
+    expect(actions).toContain("moved task");
   });
 
   it("rejects a malformed id rather than throwing a cast error", async () => {

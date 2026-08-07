@@ -85,18 +85,30 @@ async function projectIdForTask(taskId: string) {
 export const fpbRouter = router({
   // ==================== Board & columns ====================
 
-  getBoard: protectedProcedure.query(async ({ ctx }) => {
-    const board = await fpb.getOrCreateBoard(ctx.user.id);
-    const columns = await fpb.getColumns(board.id!);
-    return { board, columns };
-  }),
+  /** One project's board: its columns and the task cards sitting in them. */
+  getBoard: protectedProcedure
+    .input(z.object({ projectId: objectId }))
+    .query(async ({ input }) => {
+      const project = await fpb.getProject(input.projectId);
+      if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+      const [columns, tasks] = await Promise.all([
+        fpb.getColumns(input.projectId),
+        fpb.getTasks(input.projectId),
+      ]);
+      return { project, columns, tasks };
+    }),
 
   createColumn: protectedProcedure
-    .input(z.object({ name: z.string().min(1).max(100), color: z.string().optional() }))
+    .input(
+      z.object({
+        projectId: objectId,
+        name: z.string().min(1).max(100),
+        color: z.string().optional(),
+      })
+    )
     .mutation(async ({ ctx, input }) => {
-      requireAdmin(ctx);
-      const board = await fpb.getOrCreateBoard(ctx.user.id);
-      return fpb.createColumn(board.id!, input.name, input.color);
+      await requireProjectAccess(ctx, input.projectId);
+      return fpb.createColumn(input.projectId, input.name, input.color);
     }),
 
   updateColumn: protectedProcedure
@@ -107,8 +119,7 @@ export const fpbRouter = router({
         color: z.string().optional(),
       })
     )
-    .mutation(async ({ ctx, input }) => {
-      requireAdmin(ctx);
+    .mutation(async ({ input }) => {
       const { id, ...updates } = input;
       const saved = await fpb.updateColumn(id, updates);
       if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Column not found" });
@@ -117,10 +128,9 @@ export const fpbRouter = router({
 
   deleteColumn: protectedProcedure
     .input(z.object({ id: objectId }))
-    .mutation(async ({ ctx, input }) => {
-      requireAdmin(ctx);
+    .mutation(async ({ input }) => {
       try {
-        // Cards are moved to the neighbouring column rather than orphaned.
+        // Tasks move to the neighbouring column rather than being orphaned.
         return await fpb.deleteColumn(input.id);
       } catch (error) {
         throw new TRPCError({
@@ -132,8 +142,7 @@ export const fpbRouter = router({
 
   reorderColumns: protectedProcedure
     .input(z.array(z.object({ id: objectId, position: z.number().int().min(0) })))
-    .mutation(async ({ ctx, input }) => {
-      requireAdmin(ctx);
+    .mutation(async ({ input }) => {
       await fpb.reorderColumns(input);
       return { success: true };
     }),
@@ -144,16 +153,12 @@ export const fpbRouter = router({
     .input(
       z
         .object({
-          columnId: objectId.optional(),
           projectType: PROJECT_TYPE.optional(),
           status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
         })
         .optional()
     )
-    .query(async ({ ctx, input }) => {
-      const board = await fpb.getOrCreateBoard(ctx.user.id);
-      return fpb.getProjects(board.id!, input);
-    }),
+    .query(async ({ input }) => fpb.getProjects(input)),
 
   getProject: protectedProcedure
     .input(z.object({ id: objectId }))
@@ -166,22 +171,24 @@ export const fpbRouter = router({
   createProject: protectedProcedure
     .input(
       z.object({
-        columnId: objectId,
         title: z.string().min(1).max(255),
         description: z.string().optional(),
         projectType: PROJECT_TYPE,
         priority: PRIORITY.optional(),
         dueDate: z.date().optional(),
         memberIds: z.array(objectId).optional(),
+        // Optional custom workflow; omitted means the default five columns.
+        columns: z
+          .array(z.object({ name: z.string().min(1).max(100), color: z.string() }))
+          .max(12)
+          .optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
       requireAdmin(ctx);
-      const board = await fpb.getOrCreateBoard(ctx.user.id);
       const project = await fpb.createProject({
-        boardId: board.id!,
-        columnId: input.columnId,
         title: input.title,
+        columns: input.columns,
         description: input.description,
         projectType: input.projectType,
         priority: input.priority,
@@ -205,7 +212,6 @@ export const fpbRouter = router({
         id: objectId,
         title: z.string().min(1).max(255).optional(),
         description: z.string().optional(),
-        columnId: objectId.optional(),
         projectType: PROJECT_TYPE.optional(),
         priority: PRIORITY.optional(),
         status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
@@ -228,7 +234,8 @@ export const fpbRouter = router({
       return { success: true };
     }),
 
-  moveProject: protectedProcedure
+  /** Drag a task card between the columns of its project's board. */
+  moveTask: protectedProcedure
     .input(
       z.object({
         id: objectId,
@@ -237,11 +244,20 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      await requireProjectAccess(ctx, input.id);
-      const moved = await fpb.moveProject(input.id, input.columnId, input.position);
-      if (!moved) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-      await fpb.logActivity(input.id, ctx.user.id, "moved project");
-      return moved;
+      const projectId = await projectIdForTask(input.id);
+      await requireProjectAccess(ctx, projectId);
+      try {
+        const moved = await fpb.moveTask(input.id, input.columnId, input.position);
+        if (!moved) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+        await fpb.logActivity(projectId, ctx.user.id, "moved task", moved.title as string);
+        return moved;
+      } catch (error) {
+        if (error instanceof TRPCError) throw error;
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: error instanceof Error ? error.message : "Could not move the task",
+        });
+      }
     }),
 
   updateProjectMembers: protectedProcedure
@@ -280,6 +296,8 @@ export const fpbRouter = router({
     .input(
       z.object({
         projectId: objectId,
+        // Omitted means the first column, so a card always lands on the board.
+        columnId: objectId.optional(),
         title: z.string().min(1).max(500),
         description: z.string().optional(),
         priority: PRIORITY.optional(),
