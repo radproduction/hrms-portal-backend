@@ -44,10 +44,16 @@ echo "hrms-backend: active"
 
 log "health check"
 # Connecting to Atlas takes a moment, so poll rather than assuming it is ready.
+#
+# No `|| echo 000` here: curl already prints 000 when it cannot connect *and*
+# exits non-zero, so the fallback concatenated a second 000. The result was
+# "000000", which is not equal to "000", so the loop broke on the first attempt
+# and every failed deploy reported success.
 code=000
-for i in $(seq 1 15); do
+for _ in $(seq 1 15); do
   code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
-         http://127.0.0.1:3000/api/trpc/auth.me || echo 000)
+         http://127.0.0.1:3000/api/trpc/auth.me)
+  code=${code:-000}
   [[ "$code" != "000" ]] && break
   sleep 2
 done
