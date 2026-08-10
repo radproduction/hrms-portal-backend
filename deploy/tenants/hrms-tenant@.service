@@ -1,0 +1,64 @@
+# One HRMS portal for one organisation, as a systemd template unit.
+#
+# The %i is the tenant name, so a single file serves every organisation:
+#   sudo systemctl enable --now hrms-tenant@skntheory
+#   sudo systemctl enable --now hrms-tenant@movment
+#
+# Install:
+#   sudo cp hrms-tenant@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#
+# Logs:
+#   sudo journalctl -u hrms-tenant@skntheory -f
+#
+# Every organisation uses the same split layout as the original portal: the
+# backend and the frontend are separate repositories, checked out side by side
+# under /srv/tenants/%i. Only the backend runs as a service; nginx serves the
+# frontend build straight off disk.
+#
+# The original Rad portal keeps its own hrms-backend.service at /srv/hrms. It
+# is live and working, so it is deliberately left alone; it can be folded into
+# this scheme later with no downtime.
+
+[Unit]
+Description=HRMS portal for %i (Express + tRPC + Socket.IO)
+After=network-online.target
+Wants=network-online.target
+
+# These belong to [Unit], not [Service]; systemd ignores them anywhere else.
+# Give up only if it crash-loops hard, so a bad deploy is visible.
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=hrms
+Group=hrms
+WorkingDirectory=/srv/tenants/%i/backend
+
+# Secrets live here, root-owned, chmod 640. Each tenant has its own file, so
+# one organisation's database URI is never in another's environment.
+EnvironmentFile=/srv/tenants/%i/backend/.env
+Environment=NODE_ENV=production
+
+ExecStart=/usr/bin/node dist/index.js
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hrms-%i
+
+# Hardening. The app only ever writes to its own uploads directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/hrms/%i/uploads
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=multi-user.target
