@@ -2,7 +2,7 @@
 #
 # The %i is the tenant name, so a single file serves every organisation:
 #   sudo systemctl enable --now hrms-tenant@skntheory
-#   sudo systemctl enable --now hrms-tenant@movment
+#   sudo systemctl enable --now hrms-tenant@movement
 #
 # Install:
 #   sudo cp hrms-tenant@.service /etc/systemd/system/
