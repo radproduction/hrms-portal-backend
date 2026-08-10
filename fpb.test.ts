@@ -291,14 +291,74 @@ describeWithDb("Flow Project Board", () => {
     expect(task.title).toBe("fine");
   });
 
-  it("only lets an admin create or delete a project", async () => {
-    const { project } = await newProject("Guarded", [memberId]);
+  it("lets any employee open their own space and pick who is in it", async () => {
+    const space = await asMember().fpb.createProject({
+      title: "Member's own space",
+      projectType: "dev",
+      memberIds: [outsiderId],
+    });
+
+    // The creator is on it whether or not they listed themselves, and the
+    // board is seeded the same way an admin's would be.
+    const board = await asMember().fpb.getBoard({ projectId: space.id });
+    expect((board.project as any).memberIds.sort()).toEqual([memberId, outsiderId].sort());
+    expect(board.columns.length).toBe(5);
+
+    // The person they invited is in, and can work in it.
+    const task = await asOutsider().fpb.createTask({ projectId: space.id, title: "invited" });
+    expect(task.title).toBe("invited");
+  });
+
+  it("shows a space only to the people in it", async () => {
+    const mine = await asMember().fpb.createProject({ title: "Mine", projectType: "dev" });
+    const theirs = await asOutsider().fpb.createProject({ title: "Theirs", projectType: "dev" });
+
+    const memberSees = (await asMember().fpb.getProjects()).map((p: any) => p.title);
+    expect(memberSees).toContain("Mine");
+    expect(memberSees).not.toContain("Theirs");
+
+    // Not merely hidden from the list — it cannot be opened by guessing the id.
     await expect(
-      asMember().fpb.createProject({ title: "sneaky", projectType: "dev" })
-    ).rejects.toThrow(/Admin access required/);
+      asMember().fpb.getBoard({ projectId: theirs.id })
+    ).rejects.toThrow(/not on this project/);
     await expect(
-      asMember().fpb.deleteProject({ id: project.id })
-    ).rejects.toThrow(/Admin access required/);
+      asMember().fpb.getActivity({ projectId: theirs.id })
+    ).rejects.toThrow(/not on this project/);
+
+    // An admin still oversees everything.
+    const adminSees = (await asAdmin().fpb.getProjects()).map((p: any) => p.title);
+    expect(adminSees).toEqual(expect.arrayContaining(["Mine", "Theirs"]));
+  });
+
+  it("lets only the space's owner or an admin delete it", async () => {
+    const space = await asMember().fpb.createProject({
+      title: "Owned", projectType: "dev", memberIds: [outsiderId],
+    });
+
+    // Being invited into a space is not licence to destroy it.
+    await expect(
+      asOutsider().fpb.deleteProject({ id: space.id })
+    ).rejects.toThrow(/created this project, or an admin/);
+
+    await asMember().fpb.deleteProject({ id: space.id });
+    expect(await FpbProject.findById(space.id).lean()).toBeNull();
+  });
+
+  it("gates column edits on the column's own project", async () => {
+    const theirs = await asOutsider().fpb.createProject({ title: "Theirs", projectType: "dev" });
+    const board = await asOutsider().fpb.getBoard({ projectId: theirs.id });
+    const columnId = (board.columns[0] as any).id;
+
+    // The id alone must not be enough — these took no project into account.
+    await expect(
+      asMember().fpb.updateColumn({ id: columnId, name: "hijacked" })
+    ).rejects.toThrow(/not on this project/);
+    await expect(
+      asMember().fpb.deleteColumn({ id: columnId })
+    ).rejects.toThrow(/not on this project/);
+    await expect(
+      asMember().fpb.reorderColumns([{ id: columnId, position: 3 }])
+    ).rejects.toThrow(/not on this project/);
   });
 
   it("lets a member shape their own project's columns", async () => {

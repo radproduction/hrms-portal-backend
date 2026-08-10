@@ -24,13 +24,13 @@ const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid id");
 
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
-function requireAdmin(ctx: { user: { role?: string } }) {
-  if (ctx.user.role !== "admin") {
-    throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-  }
-}
-
-/** Admins, the creator, or anyone on the project may edit it. */
+/**
+ * Admins, the creator, or anyone on the project may see and edit it.
+ *
+ * Anyone can create a space now, so this is also the read gate: a space is
+ * private to the people in it, and "adding" someone would mean nothing if
+ * outsiders could open it anyway.
+ */
 async function requireProjectAccess(
   ctx: { user: { id: string; role?: string } },
   projectId: string
@@ -44,6 +44,37 @@ async function requireProjectAccess(
     throw new TRPCError({ code: "FORBIDDEN", message: "You are not on this project" });
   }
   return project;
+}
+
+/**
+ * Deleting a whole space is the owner's call, not every member's — otherwise
+ * anyone you invited could destroy the space you made.
+ */
+async function requireProjectOwner(
+  ctx: { user: { id: string; role?: string } },
+  projectId: string
+) {
+  const project = await fpb.getProject(projectId);
+  if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+  if (ctx.user.role === "admin") return project;
+  if (String((project as any).createdBy) !== ctx.user.id) {
+    throw new TRPCError({
+      code: "FORBIDDEN",
+      message: "Only the person who created this project, or an admin, can do that",
+    });
+  }
+  return project;
+}
+
+/** Columns are gated by the project they belong to. */
+async function requireColumnAccess(
+  ctx: { user: { id: string; role?: string } },
+  columnId: string
+) {
+  const projectId = await fpb.getColumnProjectId(columnId);
+  if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "Column not found" });
+  await requireProjectAccess(ctx, projectId);
+  return projectId;
 }
 
 /**
@@ -88,9 +119,8 @@ export const fpbRouter = router({
   /** One project's board: its columns and the task cards sitting in them. */
   getBoard: protectedProcedure
     .input(z.object({ projectId: objectId }))
-    .query(async ({ input }) => {
-      const project = await fpb.getProject(input.projectId);
-      if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+    .query(async ({ ctx, input }) => {
+      const project = await requireProjectAccess(ctx, input.projectId);
       const [columns, tasks] = await Promise.all([
         fpb.getColumns(input.projectId),
         fpb.getTasks(input.projectId),
@@ -119,7 +149,8 @@ export const fpbRouter = router({
         color: z.string().optional(),
       })
     )
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      await requireColumnAccess(ctx, input.id);
       const { id, ...updates } = input;
       const saved = await fpb.updateColumn(id, updates);
       if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Column not found" });
@@ -128,7 +159,8 @@ export const fpbRouter = router({
 
   deleteColumn: protectedProcedure
     .input(z.object({ id: objectId }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      await requireColumnAccess(ctx, input.id);
       try {
         // Tasks move to the neighbouring column rather than being orphaned.
         return await fpb.deleteColumn(input.id);
@@ -142,7 +174,8 @@ export const fpbRouter = router({
 
   reorderColumns: protectedProcedure
     .input(z.array(z.object({ id: objectId, position: z.number().int().min(0) })))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      for (const item of input) await requireColumnAccess(ctx, item.id);
       await fpb.reorderColumns(input);
       return { success: true };
     }),
@@ -158,15 +191,18 @@ export const fpbRouter = router({
         })
         .optional()
     )
-    .query(async ({ input }) => fpb.getProjects(input)),
+    .query(async ({ ctx, input }) =>
+      // Admins see every space; everyone else sees their own and the ones
+      // they were added to.
+      fpb.getProjects({
+        ...input,
+        visibleTo: ctx.user.role === "admin" ? undefined : ctx.user.id,
+      })
+    ),
 
   getProject: protectedProcedure
     .input(z.object({ id: objectId }))
-    .query(async ({ input }) => {
-      const project = await fpb.getProject(input.id);
-      if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-      return project;
-    }),
+    .query(async ({ ctx, input }) => requireProjectAccess(ctx, input.id)),
 
   createProject: protectedProcedure
     .input(
@@ -185,7 +221,8 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      requireAdmin(ctx);
+      // Anyone can open a space of their own and invite whoever they need;
+      // this is not an admin-only action.
       const project = await fpb.createProject({
         title: input.title,
         columns: input.columns,
@@ -229,7 +266,7 @@ export const fpbRouter = router({
   deleteProject: protectedProcedure
     .input(z.object({ id: objectId }))
     .mutation(async ({ ctx, input }) => {
-      requireAdmin(ctx);
+      await requireProjectOwner(ctx, input.id);
       await fpb.deleteProject(input.id);
       return { success: true };
     }),
@@ -282,13 +319,17 @@ export const fpbRouter = router({
 
   getTasks: protectedProcedure
     .input(z.object({ projectId: objectId }))
-    .query(async ({ input }) => fpb.getTasks(input.projectId)),
+    .query(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      return fpb.getTasks(input.projectId);
+    }),
 
   getTask: protectedProcedure
     .input(z.object({ id: objectId }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
       const found = await fpb.getTask(input.id);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      await requireProjectAccess(ctx, String((found.task as any).projectId));
       return found;
     }),
 
@@ -390,9 +431,11 @@ export const fpbRouter = router({
 
   getSubtask: protectedProcedure
     .input(z.object({ id: objectId }))
-    .query(async ({ input }) => {
+    .query(async ({ ctx, input }) => {
       const found = await fpb.getSubtask(input.id);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
+      const projectId = await projectIdForTask(String((found.subtask as any).taskId));
+      await requireProjectAccess(ctx, projectId);
       return found;
     }),
 
@@ -525,13 +568,19 @@ export const fpbRouter = router({
         posY: z.number().min(0).max(100),
       })
     )
-    .mutation(async ({ ctx, input }) =>
-      fpb.addAnnotationComment({ ...input, userId: ctx.user.id })
-    ),
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await fpb.getAnnotationProjectId(input.annotationId);
+      if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "File not found" });
+      await requireProjectAccess(ctx, projectId);
+      return fpb.addAnnotationComment({ ...input, userId: ctx.user.id });
+    }),
 
   resolveAnnotationComment: protectedProcedure
     .input(z.object({ id: objectId, resolved: z.boolean() }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await fpb.getAnnotationCommentProjectId(input.id);
+      if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
+      await requireProjectAccess(ctx, projectId);
       const saved = await fpb.resolveAnnotationComment(input.id, input.resolved);
       if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
       return saved;
@@ -539,7 +588,10 @@ export const fpbRouter = router({
 
   deleteAnnotation: protectedProcedure
     .input(z.object({ id: objectId }))
-    .mutation(async ({ input }) => {
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await fpb.getAnnotationProjectId(input.id);
+      if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "File not found" });
+      await requireProjectAccess(ctx, projectId);
       await fpb.deleteAnnotation(input.id);
       return { success: true };
     }),
@@ -548,7 +600,10 @@ export const fpbRouter = router({
 
   getActivity: protectedProcedure
     .input(z.object({ projectId: objectId, limit: z.number().int().min(1).max(100).default(20) }))
-    .query(async ({ input }) => fpb.getActivity(input.projectId, input.limit)),
+    .query(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      return fpb.getActivity(input.projectId, input.limit);
+    }),
 
   getUsers: protectedProcedure.query(async () => fpb.getBoardUsers()),
 });

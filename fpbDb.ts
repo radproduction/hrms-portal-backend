@@ -160,6 +160,16 @@ export async function deleteColumn(id: string) {
   return { moved: orphans, fallbackColumnId: String(fallback._id) };
 }
 
+/**
+ * The project a column belongs to, so the API can run the same access check on
+ * a column mutation that it runs on the project itself. Null when unknown.
+ */
+export async function getColumnProjectId(id: string) {
+  await requireDb();
+  const column = await FpbColumn.findById(toObjectId(id), { projectId: 1 }).lean();
+  return column ? String(column.projectId) : null;
+}
+
 export async function reorderColumns(items: { id: string; position: number }[]) {
   await requireDb();
   if (items.length === 0) return;
@@ -173,14 +183,32 @@ export async function reorderColumns(items: { id: string; position: number }[]) 
 // ==================== Projects ====================
 
 /**
- * The project list, with member and task rollups. Three queries total,
+ * The project list, with member and task rollups. Four queries total,
  * regardless of how many projects exist.
+ *
+ * `visibleTo` scopes the list to one person's spaces — the ones they created
+ * plus the ones they were added to. Anyone can create a space now, so without
+ * this every employee's private space would show up in everybody's sidebar.
+ * Omit it for admins, who see the lot.
  */
-export async function getProjects(filters?: { projectType?: string; status?: string }) {
+export async function getProjects(filters?: {
+  projectType?: string;
+  status?: string;
+  visibleTo?: string;
+}) {
   await requireDb();
   const query: Record<string, unknown> = {};
   if (filters?.projectType) query.projectType = filters.projectType;
   if (filters?.status) query.status = filters.status;
+
+  if (filters?.visibleTo) {
+    const viewer = toObjectId(filters.visibleTo);
+    const memberships = await FpbProjectMember.find({ userId: viewer }, { projectId: 1 }).lean();
+    query.$or = [
+      { createdBy: viewer },
+      { _id: { $in: memberships.map(m => m.projectId) } },
+    ];
+  }
 
   const projects = await FpbProject.find(query).sort({ createdAt: -1 }).lean();
   if (projects.length === 0) return [];
@@ -716,6 +744,20 @@ export async function addAnnotationComment(input: {
     posY: input.posY,
   });
   return normalize(created)!;
+}
+
+/** The project an annotation belongs to, for the same reason as columns. */
+export async function getAnnotationProjectId(id: string) {
+  await requireDb();
+  const annotation = await FpbAnnotation.findById(toObjectId(id), { projectId: 1 }).lean();
+  return annotation ? String(annotation.projectId) : null;
+}
+
+export async function getAnnotationCommentProjectId(id: string) {
+  await requireDb();
+  const comment = await FpbAnnotationComment.findById(toObjectId(id), { annotationId: 1 }).lean();
+  if (!comment) return null;
+  return getAnnotationProjectId(String(comment.annotationId));
 }
 
 export async function resolveAnnotationComment(id: string, resolved: boolean) {
