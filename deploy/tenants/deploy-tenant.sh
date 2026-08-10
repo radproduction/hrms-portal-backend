@@ -21,7 +21,10 @@ ROOT="/srv/tenants/$TENANT"
 [[ -f "$ROOT/backend/.env" ]] || { echo "missing $ROOT/backend/.env" >&2; exit 2; }
 
 # The health check needs to know where this tenant listens.
-PORT=$(grep -E '^PORT=' "$ROOT/backend/.env" | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+# Quotes are stripped: systemd accepts PORT="3001" in an EnvironmentFile, so
+# writing it that way is reasonable, but the quotes would end up inside the
+# health-check URL and every deploy would report a failure it did not have.
+PORT=$(grep -E '^PORT=' "$ROOT/backend/.env" | tail -1 | cut -d= -f2 | tr -d '[:space:]"'"'")
 [[ -n "$PORT" ]] || { echo "PORT is not set in $ROOT/backend/.env" >&2; exit 2; }
 
 log() { printf '\n\033[1m==> [%s] %s\033[0m\n' "$TENANT" "$1"; }

@@ -16,7 +16,7 @@ fi
 HOSTNAME_FQDN="$TENANT.$DOMAIN"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="/srv/tenants/$TENANT/backend/.env"
-PORT=$(grep -E '^PORT=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]')
+PORT=$(grep -E '^PORT=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d '[:space:]"'"'")
 [[ -n "$PORT" ]] || { echo "PORT is not set in $ENV_FILE" >&2; exit 2; }
 
 log() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
