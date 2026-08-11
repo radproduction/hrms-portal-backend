@@ -114,6 +114,10 @@ export const appRouter = router({
             employeeId: user.employeeId,
             department: user.department,
             position: user.position,
+            // The client decides where to land from this, rather than issuing
+            // a second auth.me round trip whose answer it cannot trust to be
+            // fresh.
+            role: user.role,
           },
         };
       }),
@@ -151,7 +155,10 @@ export const appRouter = router({
         const token = await createSessionToken(userId, { expiresInMs: maxAgeMs });
         setSessionCookie(ctx.res, ctx.req, token, maxAgeMs);
 
-        return { success: true };
+        // Returned for the same reason as customLogin: the client should not
+        // have to ask a second time where it is allowed to go. The guard above
+        // already rejected anyone who is not an admin, so this is not a guess.
+        return { success: true, role: "admin" as const };
       }),
 
     // Update user avatar
