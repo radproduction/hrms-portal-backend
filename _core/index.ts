@@ -34,6 +34,31 @@ async function startServer() {
       credentials: true,
     })
   );
+  /**
+   * API responses must never be cached.
+   *
+   * tRPC queries travel as GET, and auth.me is fetched at the same URL whether
+   * or not anyone is signed in. Nothing marked those responses uncacheable and
+   * the Vary header does not mention Cookie, so one cache entry served both
+   * states: Safari would replay the pre-login `null` straight after a
+   * successful login, the app would conclude nobody was signed in and bounce
+   * back to the login screen. It looked like the session cookie was broken,
+   * but the cookie was never the problem - the response was simply stale.
+   *
+   * Chrome caches these less eagerly, which is why iPhones failed every time
+   * and Android only now and then.
+   */
+  app.use("/api", (_req, res, next) => {
+    res.setHeader("Cache-Control", "no-store, no-cache, must-revalidate, private");
+    res.setHeader("Pragma", "no-cache");
+    res.setHeader("Expires", "0");
+    // Belt and braces: even a cache that ignores the above must not mix up
+    // one signed-in user's response with another's. res.vary appends rather
+    // than replacing, so tRPC's own `Vary: trpc-accept` survives.
+    res.vary("Cookie");
+    next();
+  });
+
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
