@@ -6,7 +6,7 @@ Three companies, three portals, one droplet, one domain:
 |---|---|---|---|---|
 | `nowhrms.com` | Rad (existing) | 3000 | `hrms` | `/srv/hrms` — unchanged |
 | `skntheory.nowhrms.com` | SKN Theory | 3001 | its own | `/srv/tenants/skntheory` |
-| `movment.nowhrms.com` | Movment | 3002 | its own | `/srv/tenants/movment` |
+| `movement.nowhrms.com` | Movement | 3002 | its own | `/srv/tenants/movement` |
 
 Each tenant is a separate process with its own `.env`, its own database and its
 own uploads directory. Nothing is shared.
@@ -43,7 +43,7 @@ subdomain.
 | `nginx-tenant.conf` | nginx site, HTTPS — swapped in after certbot |
 | `env.example` | Per-tenant environment |
 
-`hrms-tenant@.service` is a template, so `systemctl restart hrms-tenant@movment`
+`hrms-tenant@.service` is a template, so `systemctl restart hrms-tenant@movement`
 works without a second unit file ever being written.
 
 ### Why there are two nginx configs
@@ -93,7 +93,12 @@ under `/srv/tenants/<name>/`.
 |---|---|---|
 | heard (Rad) | `radproduction/hrms-portal-backend` | `AsadKhan2951/hrms-portal-frontend` |
 | skntheory | `radproduction/skntheory-hrms-backend` | `AsadKhan2951/skntheory-hrms-portal` |
-| movment | `radproduction/movment-hrms-backend` | `AsadKhan2951/movment-hrms-frontend` |
+| movement | `radproduction/movment-hrms-backend` | `AsadKhan2951/movment-hrms-frontend` |
+
+The Movement repositories are spelled `movment`, without the second "e". That
+is their actual name on GitHub; the tenant and its subdomain are spelled
+`movement`, which is what the client asked for. `setup-tenant.sh` takes the
+tenant name and the repository URLs separately, so the two never have to match.
 
 Because the two accounts differ, each clone may ask for its own credentials and
 only one GitHub identity is stored at a time. Clone both by hand first if that
