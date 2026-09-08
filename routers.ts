@@ -18,6 +18,7 @@ import {
   summarizeEmployeeMonth,
 } from "./attendance";
 import { fpbRouter } from "./fpbRouter";
+import { storageDelete } from "./storage";
 
 export const appRouter = router({
   system: systemRouter,
@@ -1448,6 +1449,52 @@ export const appRouter = router({
         emitPayslip({ userId: employeeId });
 
         return { success: true, payslip };
+      }),
+
+    /**
+     * Removes a payslip issued to the wrong employee.
+     *
+     * The employee's payslip list is read straight from the same records, so
+     * deleting here takes it off their side too; emitPayslip pushes that to a
+     * page they already have open rather than leaving it showing until a
+     * refresh. The notification raised when it was issued is removed with it,
+     * inside db.deletePayslip.
+     */
+    deletePayslip: protectedProcedure
+      .input(z.object({ payslipId: z.string().min(1) }))
+      .mutation(async ({ input, ctx }) => {
+        if (ctx.user.role !== "admin") {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+
+        const payslip = await db.deletePayslip(input.payslipId);
+        if (!payslip) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Payslip not found" });
+        }
+
+        // The uploaded PDF stays reachable by URL to anyone who has it, and it
+        // is payroll data, so an orphaned one is removed. Only when nothing
+        // else points at it: re-issuing a payslip for the same period replaces
+        // the record, and two records could name one file.
+        const documentUrl = String((payslip as any).documentUrl ?? "");
+        if (documentUrl.startsWith("/uploads/")) {
+          try {
+            const stillUsed = await db.countPayslipsUsingDocument(documentUrl);
+            if (stillUsed === 0) {
+              const key = documentUrl.replace(/^\/uploads\//, "");
+              await storageDelete(key);
+            }
+          } catch (error) {
+            // A file left behind must not fail the deletion the admin asked for.
+            console.error("[Payslip] could not remove document", documentUrl, error);
+          }
+        }
+
+        const employeeId = String((payslip as any).userId);
+        emitPayslip({ userId: employeeId });
+        emitNotification({ userId: employeeId });
+
+        return { success: true };
       }),
 
     getAnnouncements: protectedProcedure.query(async ({ ctx }) => {

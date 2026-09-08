@@ -52,3 +52,29 @@ export async function storageGet(
   const key = normalizeKey(relKey);
   return { key, url: `/uploads/${key}` };
 }
+
+/**
+ * Removes an uploaded file. Returns false when there was nothing to remove,
+ * so a caller tidying up after a deleted record does not have to treat an
+ * already-missing file as a failure.
+ *
+ * The key is resolved against UPLOADS_DIR and checked to still be inside it,
+ * so a stored path containing "../" cannot reach the rest of the disk.
+ */
+export async function storageDelete(relKey: string): Promise<boolean> {
+  const key = normalizeKey(relKey);
+  const filePath = path.resolve(UPLOADS_DIR, key);
+
+  const root = path.resolve(UPLOADS_DIR);
+  if (filePath !== root && !filePath.startsWith(root + path.sep)) {
+    throw new Error("Refusing to delete outside the uploads directory");
+  }
+
+  try {
+    await fs.unlink(filePath);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}

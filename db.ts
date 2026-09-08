@@ -669,6 +669,36 @@ export async function setPayslipPaidStatus(payslipId: string, paid: boolean) {
   return normalizeDoc(saved);
 }
 
+/**
+ * Removes a payslip issued to the wrong person.
+ *
+ * The employee's own views read straight from this collection, so deleting the
+ * record is what takes it off their payslip list. The notification raised when
+ * it was issued goes too - otherwise they keep a "your payslip is available"
+ * entry pointing at something that no longer exists.
+ *
+ * Returns the deleted document so the caller can tell the right employee and
+ * tidy up the uploaded file; null when there was nothing to delete.
+ */
+export async function deletePayslip(payslipId: string) {
+  await requireDb();
+  const payslip = await Payslip.findByIdAndDelete(toObjectId(payslipId)).lean();
+  if (!payslip) return null;
+
+  await Notification.deleteMany({
+    relatedType: "payslip",
+    relatedId: (payslip as any)._id,
+  });
+
+  return normalizeDoc(payslip);
+}
+
+/** How many payslips still point at an uploaded file, so it is only deleted when orphaned. */
+export async function countPayslipsUsingDocument(documentUrl: string) {
+  await requireDb();
+  return Payslip.countDocuments({ documentUrl });
+}
+
 export async function getActiveAnnouncements() {
   if (!(await optionalDb())) return [];
   const now = new Date();
