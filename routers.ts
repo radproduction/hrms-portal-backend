@@ -1632,6 +1632,28 @@ export const appRouter = router({
         return saved;
       }),
 
+    deleteDepartment: protectedProcedure
+      .input(z.object({ departmentId: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        if (!isSuperAdmin(ctx.user.role)) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "Only a super admin can delete a department",
+          });
+        }
+        try {
+          const removed = await departments.deleteDepartment(input.departmentId);
+          if (!removed) throw new TRPCError({ code: "NOT_FOUND", message: "Department not found" });
+          return removed;
+        } catch (error) {
+          if (error instanceof TRPCError) throw error;
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: error instanceof Error ? error.message : "Could not delete the department",
+          });
+        }
+      }),
+
     /**
      * Puts someone in charge of a department, or clears the post.
      *

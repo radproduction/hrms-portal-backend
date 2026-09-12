@@ -128,6 +128,28 @@ export async function setDepartmentHead(departmentId: string, userId: string | n
   return { id: String(saved._id), headUserId: String(user._id) };
 }
 
+/**
+ * Removes a department.
+ *
+ * Refuses while anyone is still in it: a user left pointing at a department
+ * that no longer exists has no head, so their leave would silently stop
+ * routing anywhere. Move people out first, and the error says how many.
+ */
+export async function deleteDepartment(departmentId: string) {
+  await requireDb();
+  const id = toId(departmentId);
+
+  const remaining = await User.countDocuments({ departmentId: id });
+  if (remaining > 0) {
+    throw new Error(
+      `${remaining} ${remaining === 1 ? "person is" : "people are"} still in this department. Move them first.`
+    );
+  }
+
+  const removed = await Department.findByIdAndDelete(id).lean();
+  return removed ? { id: String(removed._id), name: removed.name } : null;
+}
+
 export async function setDepartmentProjectRights(departmentId: string, allowed: boolean) {
   await requireDb();
   const saved = await Department.findByIdAndUpdate(
