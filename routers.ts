@@ -1689,6 +1689,30 @@ export const appRouter = router({
         }
       }),
 
+    /**
+     * Lets a department's head open projects on the board.
+     *
+     * Super admin only. This is the grant the client asked for: the board
+     * should reflect who actually runs things, rather than filling up with a
+     * space per person.
+     */
+    setDepartmentProjectRights: protectedProcedure
+      .input(z.object({ departmentId: z.string().min(1), allowed: z.boolean() }))
+      .mutation(async ({ ctx, input }) => {
+        if (!isSuperAdmin(ctx.user.role)) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "Only a super admin can grant project rights",
+          });
+        }
+        const saved = await departments.setDepartmentProjectRights(
+          input.departmentId,
+          input.allowed
+        );
+        if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Department not found" });
+        return saved;
+      }),
+
     /** Which roles the caller is allowed to hand out, for the role picker. */
     getAssignableRoles: protectedProcedure.query(async ({ ctx }) => {
       return assignableRoles(ctx.user.role).map(role => ({

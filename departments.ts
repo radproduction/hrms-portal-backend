@@ -196,6 +196,31 @@ export async function departmentsLedBy(userId: string): Promise<string[]> {
 }
 
 /**
+ * Whether someone may open a project on the board.
+ *
+ * Anyone could, for a while. The client now wants it to be a grant a super
+ * admin hands to a department head, so the board reflects who actually runs
+ * things rather than filling up with a space per person.
+ *
+ * Org-wide roles are always allowed; a head needs the grant on at least one
+ * department they lead.
+ */
+export async function canOpenProjects(actor: {
+  id: string;
+  role?: string;
+}): Promise<boolean> {
+  if (isOrgWide(actor.role)) return true;
+  if (!hasRank(actor.role, "dept_head")) return false;
+
+  await requireDb();
+  const granted = await Department.countDocuments({
+    headUserId: toId(actor.id),
+    canCreateProjects: true,
+  });
+  return granted > 0;
+}
+
+/**
  * Whether `actor` may act on `target`'s records.
  *
  * Org-wide roles reach everyone. A department head reaches the people in the
