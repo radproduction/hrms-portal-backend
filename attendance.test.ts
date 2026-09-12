@@ -113,6 +113,42 @@ describe("summarizeEmployeeMonth", () => {
     status: "completed",
   });
 
+  it("still reports an auto-closed session as a missing clock-out", () => {
+    // The shift sweep gives these a timeOut and a "completed" status, so a
+    // naive check sees a tidy 12-hour day. The person never clocked out
+    // though, and that is exactly what this column is for - if it stopped
+    // counting them, the sweep would quietly hide the problem it exists for.
+    const summary = summarizeEmployeeMonth({
+      employee,
+      entries: [
+        { ...entryOn("2026-03-02", 12), autoClockedOut: true },
+        entryOn("2026-03-03", 8),
+      ],
+      leaveDates: new Set(),
+      month: 3,
+      year: 2026,
+      todayKey: "2026-03-31",
+      offsetMinutes: OFFSET,
+    });
+
+    expect(summary.missingClockOuts).toBe(1);
+    expect(summary.presentDays).toBe(2);
+  });
+
+  it("does not flag an ordinary long day as a missing clock-out", () => {
+    const summary = summarizeEmployeeMonth({
+      employee,
+      entries: [entryOn("2026-03-02", 12)],
+      leaveDates: new Set(),
+      month: 3,
+      year: 2026,
+      todayKey: "2026-03-31",
+      offsetMinutes: OFFSET,
+    });
+
+    expect(summary.missingClockOuts).toBe(0);
+  });
+
   it("counts present, absent and leave against working days only", () => {
     const summary = summarizeEmployeeMonth({
       employee,

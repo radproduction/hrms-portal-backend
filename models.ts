@@ -46,6 +46,13 @@ export interface ITimeEntry extends Document {
   timeOut?: Date;
   totalHours?: number;
   status: 'active' | 'completed' | 'early_out';
+  /**
+   * True when the session was closed by the shift sweep rather than by the
+   * person. Their real finishing time is unknown, so the hours on these rows
+   * are a cap, not a measurement - reports and payroll should show them as
+   * needing a human to confirm.
+   */
+  autoClockedOut?: boolean;
   notes?: string;
   location?: {
     lat: number;
@@ -65,6 +72,7 @@ const timeEntrySchema = new Schema<ITimeEntry>({
   timeOut: Date,
   totalHours: Number,
   status: { type: String, enum: ['active', 'completed', 'early_out'], default: 'active', required: true },
+  autoClockedOut: { type: Boolean, default: false },
   notes: String,
   location: {
     lat: Number,

@@ -148,6 +148,8 @@ export type RawTimeEntry = {
   timeOut?: Date | string | null;
   totalHours?: number | null;
   status?: string;
+  /** Closed by the shift sweep because nobody clocked out. */
+  autoClockedOut?: boolean;
 };
 
 export type DayRecord = {
@@ -257,7 +259,12 @@ export function summarizeEmployeeMonth(input: {
     const measured = dayEntries.map(e => entryHours(e, maxShiftHours));
     const dayHours = measured.reduce((sum, m) => sum + m.hours, 0);
     const dayIncomplete = measured.filter(m => m.incomplete).length;
-    const openEntries = dayEntries.filter(e => !e.timeOut || e.status === "active").length;
+    // An auto-closed session counts here too. The sweep gives it a timeOut and
+    // a "completed" status, so without this the fix would hide the very thing
+    // it exists to catch: the person still never clocked out.
+    const openEntries = dayEntries.filter(
+      e => !e.timeOut || e.status === "active" || e.autoClockedOut === true
+    ).length;
 
     let status: DayRecord["status"];
     if (dayEntries.length > 0) {

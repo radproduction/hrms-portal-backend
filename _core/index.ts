@@ -9,6 +9,7 @@ import avatarUploadRouter from "../avatar-upload";
 import employeeDocumentUploadRouter from "../employee-document-upload";
 import { connectToMongoDB } from "../mongodb";
 import { UPLOADS_DIR } from "../storage";
+import { startShiftSweep } from "../shiftSweep";
 import { initRealtime } from "./realtime";
 import {
   clockInUser,
@@ -21,6 +22,10 @@ import { ENV } from "./env";
 
 async function startServer() {
   await connectToMongoDB();
+
+  // Sessions nobody clocked out of used to stay open indefinitely, so hours
+  // and attendance drifted further from reality every day.
+  startShiftSweep();
 
   const app = express();
   const server = createServer(app);
