@@ -19,6 +19,8 @@ import {
 } from "./attendance";
 import { fpbRouter } from "./fpbRouter";
 import { storageDelete } from "./storage";
+import { isAnyHead, isOrgWide, isSuperAdmin, canAssignRole, assignableRoles, ROLE_LABELS } from "./roles";
+import * as departments from "./departments";
 
 export const appRouter = router({
   system: systemRouter,
@@ -61,7 +63,10 @@ export const appRouter = router({
           });
         }
 
-        if (user.role === "admin") {
+        // Two-factor covers the roles that can see the whole organisation's
+        // data. Department heads are not put through it: their reach is one
+        // department, and the friction would be daily.
+        if (isOrgWide(user.role)) {
           const fullUser = await db.getUserByIdWithSecret(user.id);
           if (!fullUser) {
             throw new TRPCError({
@@ -133,7 +138,7 @@ export const appRouter = router({
       .mutation(async ({ input, ctx }) => {
         const { userId } = await verifySessionToken(input.token, "two_factor");
         const user = await db.getUserByIdWithSecret(userId);
-        if (!user || user.role !== "admin") {
+        if (!user || !isOrgWide(user.role)) {
           throw new TRPCError({ code: "UNAUTHORIZED", message: "Unauthorized" });
         }
 
@@ -157,9 +162,10 @@ export const appRouter = router({
         setSessionCookie(ctx.res, ctx.req, token, maxAgeMs);
 
         // Returned for the same reason as customLogin: the client should not
-        // have to ask a second time where it is allowed to go. The guard above
-        // already rejected anyone who is not an admin, so this is not a guess.
-        return { success: true, role: "admin" as const };
+        // have to ask a second time where it is allowed to go. Read from the
+        // record rather than assumed - two-factor now covers head_of_ops as
+        // well, so hardcoding "admin" here would send them to the wrong place.
+        return { success: true, role: user.role };
       }),
 
     // Update user avatar
@@ -208,7 +214,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         await db.updateUserPassword(input.id, input.newPassword);
@@ -825,7 +831,7 @@ export const appRouter = router({
 
   employees: router({
     list: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getAllUsers();
@@ -846,7 +852,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
 
@@ -918,7 +924,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
 
@@ -971,7 +977,7 @@ export const appRouter = router({
 
   admin: router({
     getLeaveRequests: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getAllLeaveApplicationsWithUsers();
@@ -986,7 +992,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         await db.updateLeaveApplicationStatus(input.id, input.status, ctx.user.id, input.rejectionReason);
@@ -994,7 +1000,7 @@ export const appRouter = router({
       }),
 
     getFormSubmissions: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getAllFormSubmissionsWithUsers();
@@ -1009,7 +1015,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         await db.updateFormSubmissionStatus(input.id, input.status, ctx.user.id, input.response);
@@ -1017,7 +1023,7 @@ export const appRouter = router({
       }),
 
     getProjectsOverview: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getProjectsWithAssignments();
@@ -1026,7 +1032,7 @@ export const appRouter = router({
     getProjectTasks: protectedProcedure
       .input(z.object({ projectId: z.string() }))
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getAllProjectTasks(input.projectId);
@@ -1045,7 +1051,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         const created = await db.createProjectTask({
@@ -1075,7 +1081,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         const { taskId, ...updates } = input;
@@ -1090,7 +1096,7 @@ export const appRouter = router({
     getEmployeeProjects: protectedProcedure
       .input(z.object({ employeeId: z.string() }))
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getProjectsForEmployee(input.employeeId);
@@ -1099,14 +1105,14 @@ export const appRouter = router({
     getEmployeeTasks: protectedProcedure
       .input(z.object({ employeeId: z.string() }))
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getTasksByEmployee(input.employeeId);
       }),
 
     getResourcePerformance: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getResourcePerformance();
@@ -1115,7 +1121,7 @@ export const appRouter = router({
     deleteProject: protectedProcedure
       .input(z.object({ id: z.string() }))
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         await db.deleteProject(input.id);
@@ -1125,7 +1131,7 @@ export const appRouter = router({
     deleteTask: protectedProcedure
       .input(z.object({ id: z.string() }))
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         await db.deleteProjectTask(input.id);
@@ -1135,7 +1141,7 @@ export const appRouter = router({
     getTasksByDate: protectedProcedure
       .input(z.object({ date: z.date() }))
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         const start = new Date(input.date);
@@ -1157,7 +1163,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         const projectId = await db.createProject({
@@ -1187,14 +1193,14 @@ export const appRouter = router({
       }),
 
     getOngoingTasks: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getOngoingTasksWithAssignments();
     }),
 
     getEmployeeStatusSnapshot: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getEmployeeStatusSnapshot();
@@ -1203,7 +1209,7 @@ export const appRouter = router({
     getAverageHours: protectedProcedure
       .input(z.object({ days: z.number().optional() }))
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getAverageHoursByDay(input.days ?? 5);
@@ -1217,7 +1223,7 @@ export const appRouter = router({
         })
       )
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getTimeEntriesByRangeForAll(input.startDate, input.endDate);
@@ -1232,7 +1238,7 @@ export const appRouter = router({
         })
       )
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         return await db.getTimeEntriesByDateRange(input.employeeId, input.startDate, input.endDate);
@@ -1251,7 +1257,7 @@ export const appRouter = router({
         })
       )
       .query(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
 
@@ -1331,7 +1337,7 @@ export const appRouter = router({
       }),
 
     getPayslips: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getAllPayslipsWithUsers();
@@ -1353,7 +1359,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
 
@@ -1415,7 +1421,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
 
@@ -1463,7 +1469,7 @@ export const appRouter = router({
     deletePayslip: protectedProcedure
       .input(z.object({ payslipId: z.string().min(1) }))
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
 
@@ -1497,8 +1503,140 @@ export const appRouter = router({
         return { success: true };
       }),
 
+    // ==================== Departments & the hierarchy ====================
+
+    /**
+     * Every department with its head. Readable by anyone org-wide and by
+     * department heads, who need to see the structure they sit in.
+     */
+    getDepartments: protectedProcedure.query(async ({ ctx }) => {
+      if (!isAnyHead(ctx.user.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Not permitted" });
+      }
+      return departments.listDepartments();
+    }),
+
+    createDepartment: protectedProcedure
+      .input(z.object({ name: z.string().min(1).max(80) }))
+      .mutation(async ({ ctx, input }) => {
+        if (!isOrgWide(ctx.user.role)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+        try {
+          return await departments.createDepartment(input.name);
+        } catch (error) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: error instanceof Error ? error.message : "Could not create the department",
+          });
+        }
+      }),
+
+    renameDepartment: protectedProcedure
+      .input(z.object({ departmentId: z.string().min(1), name: z.string().min(1).max(80) }))
+      .mutation(async ({ ctx, input }) => {
+        if (!isOrgWide(ctx.user.role)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+        const saved = await departments.renameDepartment(input.departmentId, input.name);
+        if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Department not found" });
+        return saved;
+      }),
+
+    /**
+     * Puts someone in charge of a department, or clears the post.
+     *
+     * Super admin only: this is how the hierarchy is set, and it promotes the
+     * person to dept_head as a side effect. Letting a head of operations do it
+     * would let them build a chain of command the level above cannot see.
+     */
+    setDepartmentHead: protectedProcedure
+      .input(
+        z.object({
+          departmentId: z.string().min(1),
+          userId: z.string().min(1).nullable(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        if (!isSuperAdmin(ctx.user.role)) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "Only a super admin can appoint a department head",
+          });
+        }
+        try {
+          const saved = await departments.setDepartmentHead(input.departmentId, input.userId);
+          if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Department not found" });
+          return saved;
+        } catch (error) {
+          if (error instanceof TRPCError) throw error;
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: error instanceof Error ? error.message : "Could not set the head",
+          });
+        }
+      }),
+
+    /** Moves an employee into a department. */
+    setUserDepartment: protectedProcedure
+      .input(
+        z.object({
+          userId: z.string().min(1),
+          departmentId: z.string().min(1).nullable(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        if (!isOrgWide(ctx.user.role)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        }
+        try {
+          await departments.setUserDepartment(input.userId, input.departmentId);
+          return { success: true };
+        } catch (error) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: error instanceof Error ? error.message : "Could not move the employee",
+          });
+        }
+      }),
+
+    /** Which roles the caller is allowed to hand out, for the role picker. */
+    getAssignableRoles: protectedProcedure.query(async ({ ctx }) => {
+      return assignableRoles(ctx.user.role).map(role => ({
+        value: role,
+        label: ROLE_LABELS[role],
+      }));
+    }),
+
+    /**
+     * Changes someone's role.
+     *
+     * Guarded by canAssignRole, which only ever permits roles strictly below
+     * the caller's own - so nobody can promote a peer to their own level, or
+     * mint a second super admin.
+     */
+    setUserRole: protectedProcedure
+      .input(z.object({ userId: z.string().min(1), role: z.string().min(1) }))
+      .mutation(async ({ ctx, input }) => {
+        if (!canAssignRole(ctx.user.role, input.role)) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "You cannot assign that role",
+          });
+        }
+        if (input.userId === ctx.user.id) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "You cannot change your own role",
+          });
+        }
+        const saved = await db.setUserRole(input.userId, input.role);
+        if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Employee not found" });
+        return saved;
+      }),
+
     getAnnouncements: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getAnnouncementsWithReadCounts();
@@ -1506,7 +1644,7 @@ export const appRouter = router({
 
     // Task completion stats (all tasks)
     getTaskStats: protectedProcedure.query(async ({ ctx }) => {
-      if (ctx.user.role !== "admin") {
+      if (!isOrgWide(ctx.user.role)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getTaskStatsForAll();
@@ -1521,7 +1659,7 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         const announcement = await db.createAnnouncement({
@@ -1555,7 +1693,7 @@ export const appRouter = router({
     deleteAnnouncement: protectedProcedure
       .input(z.object({ id: z.string() }))
       .mutation(async ({ input, ctx }) => {
-        if (ctx.user.role !== "admin") {
+        if (!isOrgWide(ctx.user.role)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
         }
         await db.deleteAnnouncement(input.id);

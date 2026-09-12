@@ -14,6 +14,7 @@ import { TRPCError } from "@trpc/server";
 import { protectedProcedure, router } from "./_core/trpc";
 import * as fpb from "./fpbDb";
 import * as db from "./db";
+import { isOrgWide } from "./roles";
 import { emitNotification } from "./_core/realtime";
 import { storagePut } from "./storage";
 
@@ -37,7 +38,7 @@ async function requireProjectAccess(
 ) {
   const project = await fpb.getProject(projectId);
   if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-  if (ctx.user.role === "admin") return project;
+  if (isOrgWide(ctx.user.role)) return project;
   const isCreator = String((project as any).createdBy) === ctx.user.id;
   const isMember = ((project as any).memberIds ?? []).includes(ctx.user.id);
   if (!isCreator && !isMember) {
@@ -56,7 +57,7 @@ async function requireProjectOwner(
 ) {
   const project = await fpb.getProject(projectId);
   if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-  if (ctx.user.role === "admin") return project;
+  if (isOrgWide(ctx.user.role)) return project;
   if (String((project as any).createdBy) !== ctx.user.id) {
     throw new TRPCError({
       code: "FORBIDDEN",
@@ -196,7 +197,7 @@ export const fpbRouter = router({
       // they were added to.
       fpb.getProjects({
         ...input,
-        visibleTo: ctx.user.role === "admin" ? undefined : ctx.user.id,
+        visibleTo: isOrgWide(ctx.user.role) ? undefined : ctx.user.id,
       })
     ),
 

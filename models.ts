@@ -7,13 +7,16 @@ export interface IUser extends Document {
   name?: string;
   email?: string;
   loginMethod?: string;
-  role: 'user' | 'admin';
+  role: 'user' | 'dept_head' | 'head_of_ops' | 'admin';
   employeeId?: string;
   password?: string;
   twoFactorEnabled?: boolean;
   twoFactorSecret?: string;
   avatar?: string;
+  /** Display name, kept for the reports and filters that already group by it. */
   department?: string;
+  /** The department record, which is what resolves to a head. */
+  departmentId?: Types.ObjectId;
   position?: string;
   createdAt: Date;
   updatedAt: Date;
@@ -25,7 +28,14 @@ const userSchema = new Schema<IUser>({
   name: String,
   email: String,
   loginMethod: String,
-  role: { type: String, enum: ['user', 'admin'], default: 'user', required: true },
+  // Four levels, lowest first. roles.ts holds the ordering and the checks;
+  // never compare these strings directly, or adding a level silently locks it
+  // out of everything guarded by an equality test.
+  role: { type: String, enum: ['user', 'dept_head', 'head_of_ops', 'admin'], default: 'user', required: true },
+  // The department this person belongs to. `department` below stays as the
+  // display name so existing reports and filters keep working; this is the one
+  // that resolves to a head.
+  departmentId: { type: Schema.Types.ObjectId, ref: 'Department' },
   employeeId: { type: String, unique: true, sparse: true },
   password: String,
   twoFactorEnabled: { type: Boolean, default: false },
@@ -37,6 +47,39 @@ const userSchema = new Schema<IUser>({
 }, { timestamps: true });
 
 export const User = model<IUser>('User', userSchema);
+
+// ==================== Department Model ====================
+/**
+ * A department and who leads it.
+ *
+ * Departments were only ever a free-text string on each user, so there was
+ * nowhere to record a head - which is what leave approval and the project
+ * board both need. The string stays as the display name; this record is what
+ * answers "who approves for this person".
+ */
+export interface IDepartment extends Document {
+  _id: Types.ObjectId;
+  name: string;
+  headUserId?: Types.ObjectId;
+  /**
+   * Granted by a super admin. Lets this department's head open projects on the
+   * board and staff them; without it they can only work in projects they were
+   * added to.
+   */
+  canCreateProjects: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const departmentSchema = new Schema<IDepartment>({
+  // Unique so two spellings of one department cannot each hold a different
+  // head, leaving it ambiguous who approves.
+  name: { type: String, required: true, unique: true, trim: true },
+  headUserId: { type: Schema.Types.ObjectId, ref: 'User' },
+  canCreateProjects: { type: Boolean, default: false },
+}, { timestamps: true });
+
+export const Department = model<IDepartment>('Department', departmentSchema);
 
 // ==================== Time Entry Model ====================
 export interface ITimeEntry extends Document {

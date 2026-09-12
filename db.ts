@@ -278,10 +278,42 @@ export async function getUserById(id: string) {
   return sanitizeUser(normalizeDoc(user));
 }
 
-export async function getUserByIdWithSecret(id: string) {
+/**
+ * The two-factor fields sanitizeUser strips, for the sign-in flow that needs
+ * them. Typed explicitly because normalizeDoc widens to `{ id: any }`, and the
+ * callers then read role, email and the secret off a value TypeScript believes
+ * has none of them.
+ */
+export type UserWithSecret = {
+  id: string;
+  name?: string;
+  email?: string;
+  employeeId?: string;
+  role?: string;
+  twoFactorSecret?: string;
+  twoFactorEnabled?: boolean;
+};
+
+export async function getUserByIdWithSecret(
+  id: string
+): Promise<UserWithSecret | undefined> {
   if (!(await optionalDb())) return undefined;
   const user = await User.findById(toObjectId(id)).lean();
-  return normalizeDoc(user);
+  return normalizeDoc(user) as UserWithSecret | undefined;
+}
+
+/**
+ * Changes someone's role. Whether the caller is allowed to set this particular
+ * role is decided by canAssignRole in roles.ts, before this is reached.
+ */
+export async function setUserRole(userId: string, role: string) {
+  await requireDb();
+  const saved = await User.findByIdAndUpdate(
+    toObjectId(userId),
+    { role },
+    { returnDocument: "after" }
+  ).lean();
+  return sanitizeUser(normalizeDoc(saved));
 }
 
 export async function setUserTwoFactorSecret(userId: string, secret: string) {
