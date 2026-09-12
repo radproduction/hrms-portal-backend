@@ -212,6 +212,8 @@ export interface ILeaveApplication extends Document {
   endDate: Date;
   reason: string;
   status: 'pending' | 'approved' | 'rejected';
+  /** Routed to at submission time: the applicant's department head, or above. */
+  approverUserId?: Types.ObjectId;
   approvedBy?: Types.ObjectId;
   approvedAt?: Date;
   rejectionReason?: string;
@@ -226,6 +228,17 @@ const leaveApplicationSchema = new Schema<ILeaveApplication>({
   endDate: { type: Date, required: true },
   reason: { type: String, required: true },
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', required: true },
+  /**
+   * Who this was sent to when it was submitted: normally the applicant's
+   * department head.
+   *
+   * Recorded rather than worked out on demand, so an application stays with
+   * the person who was actually asked. Recomputing it would quietly hand a
+   * pending request to somebody else the moment the applicant changed
+   * department or a head stepped down.
+   */
+  approverUserId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+  /** Who decided it. Not necessarily the approver above - anyone org-wide can step in. */
   approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
   approvedAt: Date,
   rejectionReason: String,

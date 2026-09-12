@@ -21,6 +21,7 @@ import { fpbRouter } from "./fpbRouter";
 import { storageDelete } from "./storage";
 import { isAnyHead, isOrgWide, isSuperAdmin, canAssignRole, assignableRoles, ROLE_LABELS } from "./roles";
 import * as departments from "./departments";
+import { routeLeaveFor } from "./leaveRouting";
 
 export const appRouter = router({
   system: systemRouter,
@@ -495,12 +496,37 @@ export const appRouter = router({
         reason: z.string(),
       }))
       .mutation(async ({ input, ctx }) => {
+        // Routed once, at submission, and recorded on the application - see
+        // leaveRouting.ts for why it is not recomputed on every read.
+        const routing = await routeLeaveFor(ctx.user.id);
+
         await db.createLeaveApplication({
           userId: ctx.user.id,
           ...input,
+          approverUserId: routing.approverId,
         });
 
-        return { success: true };
+        if (routing.approverId) {
+          const dates = `${input.startDate.toLocaleDateString("en-GB")} - ${input.endDate.toLocaleDateString("en-GB")}`;
+          try {
+            await db.createNotification({
+              userId: routing.approverId,
+              type: "announcement",
+              title: "Leave request to review",
+              message: `${ctx.user.name ?? "An employee"} requested ${input.leaveType} leave for ${dates}.`,
+              priority: "medium",
+              relatedType: "leave",
+            });
+            emitNotification({ userId: routing.approverId });
+          } catch (error) {
+            // The request is recorded either way; a failed ping must not lose it.
+            console.error("[Leave] could not notify the approver", error);
+          }
+        }
+
+        // Reported plainly, so nobody assumes their head was asked when there
+        // was no head to ask.
+        return { success: true, routedTo: routing.reason };
       }),
 
     // Get user's leave applications
@@ -976,11 +1002,21 @@ export const appRouter = router({
   }),
 
   admin: router({
+    /**
+     * The approval queue.
+     *
+     * Org-wide roles see every request, which is also the escape hatch for one
+     * routed to somebody who has since left. A department head sees only what
+     * was sent to them.
+     */
     getLeaveRequests: protectedProcedure.query(async ({ ctx }) => {
-      if (!isOrgWide(ctx.user.role)) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+      if (isOrgWide(ctx.user.role)) {
+        return await db.getAllLeaveApplicationsWithUsers();
       }
-      return await db.getAllLeaveApplicationsWithUsers();
+      if (isAnyHead(ctx.user.role)) {
+        return await db.getLeaveApplicationsForApprover(ctx.user.id);
+      }
+      throw new TRPCError({ code: "FORBIDDEN", message: "Not permitted" });
     }),
 
     updateLeaveRequest: protectedProcedure
@@ -992,10 +1028,63 @@ export const appRouter = router({
         })
       )
       .mutation(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+        const leave = await db.getLeaveApplicationById(input.id);
+        if (!leave) {
+          throw new TRPCError({ code: "NOT_FOUND", message: "Leave request not found" });
         }
-        await db.updateLeaveApplicationStatus(input.id, input.status, ctx.user.id, input.rejectionReason);
+
+        const applicantId = String((leave as any).userId);
+        const assignedTo = (leave as any).approverUserId
+          ? String((leave as any).approverUserId)
+          : null;
+
+        // Nobody decides their own leave, whatever their role. Routing already
+        // escalates a head's own request; this is the backstop for a request
+        // that reached them another way.
+        if (applicantId === ctx.user.id) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "You cannot decide your own leave request",
+          });
+        }
+
+        const permitted = isOrgWide(ctx.user.role) || assignedTo === ctx.user.id;
+        if (!permitted) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "This request was not sent to you",
+          });
+        }
+
+        await db.updateLeaveApplicationStatus(
+          input.id,
+          input.status,
+          ctx.user.id,
+          input.rejectionReason
+        );
+
+        // The applicant hears the outcome; previously they had to keep
+        // checking the page to find out.
+        if (input.status !== "pending") {
+          try {
+            await db.createNotification({
+              userId: applicantId,
+              type: input.status === "approved" ? "leave_approved" : "leave_rejected",
+              title: input.status === "approved" ? "Leave approved" : "Leave rejected",
+              message:
+                input.status === "approved"
+                  ? `Your leave request has been approved by ${ctx.user.name ?? "your approver"}.`
+                  : `Your leave request was rejected: ${input.rejectionReason || "no reason given"}.`,
+              priority: "medium",
+              relatedId: input.id,
+              relatedType: "leave",
+            });
+            emitNotification({ userId: applicantId });
+          } catch (error) {
+            console.error("[Leave] could not notify the applicant", error);
+          }
+        }
+
         return { success: true };
       }),
 

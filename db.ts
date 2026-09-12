@@ -492,13 +492,43 @@ export async function createLeaveApplication(leave: {
   startDate: Date;
   endDate: Date;
   reason: string;
+  /** Whoever it is being sent to. Null when there is nobody to route it to. */
+  approverUserId?: string | null;
 }) {
   await requireDb();
+  const { approverUserId, ...rest } = leave;
   const created = await LeaveApplication.create({
-    ...leave,
+    ...rest,
     userId: toObjectId(leave.userId),
+    approverUserId: approverUserId ? toObjectId(approverUserId) : undefined,
   });
   return normalizeDoc(created);
+}
+
+/**
+ * The applications one approver is responsible for.
+ *
+ * Matched on approverUserId rather than on the applicant's current department,
+ * so a request stays with the person it was sent to even if the applicant
+ * moves team while it is pending.
+ */
+export async function getLeaveApplicationsForApprover(approverId: string) {
+  await requireDb();
+  const leaves = await LeaveApplication.find({ approverUserId: toObjectId(approverId) })
+    .sort({ createdAt: -1 })
+    .populate("userId")
+    .lean();
+
+  return leaves.map((leave: any) => ({
+    ...normalizeDoc(leave),
+    user: leave.userId ? normalizeDoc(leave.userId as any) : undefined,
+  }));
+}
+
+export async function getLeaveApplicationById(id: string) {
+  await requireDb();
+  const leave = await LeaveApplication.findById(toObjectId(id)).lean();
+  return normalizeDoc(leave);
 }
 
 export async function getLeaveApplicationsByUser(userId: string) {
