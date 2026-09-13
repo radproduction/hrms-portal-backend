@@ -2,7 +2,7 @@ import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import mongoose from "mongoose";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
-import { Notification, User } from "./models";
+import { Department, Notification, User } from "./models";
 import {
   FpbActivity,
   FpbAnnotation,
@@ -30,7 +30,7 @@ describeWithDb("Flow Project Board", () => {
   let memberId: string;
   let outsiderId: string;
 
-  const ctxFor = (id: string, role: "admin" | "user") =>
+  const ctxFor = (id: string, role: string) =>
     ({
       user: { id, role },
       req: { protocol: "https", headers: {} },
@@ -40,6 +40,8 @@ describeWithDb("Flow Project Board", () => {
   const asAdmin = () => appRouter.createCaller(ctxFor(adminId, "admin"));
   const asMember = () => appRouter.createCaller(ctxFor(memberId, "user"));
   const asOutsider = () => appRouter.createCaller(ctxFor(outsiderId, "user"));
+  /** Same person, but acting with the department-head role the grant gives them. */
+  const asHead = (id: string) => appRouter.createCaller(ctxFor(id, "dept_head"));
 
   beforeAll(async () => {
     await mongoose.connect(process.env.MONGODB_URI as string);
@@ -64,6 +66,7 @@ describeWithDb("Flow Project Board", () => {
     ]);
     await Promise.all([
       FpbProject.deleteMany({}),
+      Department.deleteMany({ name: /^FPB Grant / }),
       Notification.deleteMany({ userId: { $in: ids } }),
       User.deleteMany({ _id: { $in: ids } }),
     ]);
@@ -76,6 +79,22 @@ describeWithDb("Flow Project Board", () => {
       FpbProjectMember.deleteMany({}), FpbTaskMember.deleteMany({}), FpbSubtask.deleteMany({}),
     ]);
   });
+
+  /**
+   * Makes someone a department head with the right to open projects.
+   *
+   * Creating a project is a granted right; these tests are about what an owner
+   * who is not an admin may do once a project exists, so the actor is given
+   * the grant properly rather than the gate being bypassed.
+   */
+  async function grantProjectRights(userId: string) {
+    const department = await Department.findOneAndUpdate(
+      { name: `FPB Grant ${userId}` },
+      { name: `FPB Grant ${userId}`, headUserId: userId, canCreateProjects: true },
+      { upsert: true, returnDocument: "after" }
+    ).lean();
+    await User.findByIdAndUpdate(userId, { role: "dept_head", departmentId: department!._id });
+  }
 
   /** Creates a project and returns it together with its seeded columns. */
   async function newProject(title = "Project", memberIds: string[] = []) {
@@ -291,8 +310,13 @@ describeWithDb("Flow Project Board", () => {
     expect(task.title).toBe("fine");
   });
 
-  it("lets any employee open their own space and pick who is in it", async () => {
-    const space = await asMember().fpb.createProject({
+  it("lets a granted head open a space and pick who is in it", async () => {
+    // Opening a project is a granted right - see projectRights.test.ts. These
+    // tests are about what an owner who is not an admin can do once inside,
+    // so the actor is given the grant rather than the rule being bent.
+    await grantProjectRights(memberId);
+
+    const space = await asHead(memberId).fpb.createProject({
       title: "Member's own space",
       projectType: "dev",
       memberIds: [outsiderId],
@@ -310,8 +334,10 @@ describeWithDb("Flow Project Board", () => {
   });
 
   it("shows a space only to the people in it", async () => {
-    const mine = await asMember().fpb.createProject({ title: "Mine", projectType: "dev" });
-    const theirs = await asOutsider().fpb.createProject({ title: "Theirs", projectType: "dev" });
+    await grantProjectRights(memberId);
+    await grantProjectRights(outsiderId);
+    const mine = await asHead(memberId).fpb.createProject({ title: "Mine", projectType: "dev" });
+    const theirs = await asHead(outsiderId).fpb.createProject({ title: "Theirs", projectType: "dev" });
 
     const memberSees = (await asMember().fpb.getProjects()).map((p: any) => p.title);
     expect(memberSees).toContain("Mine");
@@ -331,7 +357,8 @@ describeWithDb("Flow Project Board", () => {
   });
 
   it("lets only the space's owner or an admin delete it", async () => {
-    const space = await asMember().fpb.createProject({
+    await grantProjectRights(memberId);
+    const space = await asHead(memberId).fpb.createProject({
       title: "Owned", projectType: "dev", memberIds: [outsiderId],
     });
 
@@ -345,7 +372,8 @@ describeWithDb("Flow Project Board", () => {
   });
 
   it("gates column edits on the column's own project", async () => {
-    const theirs = await asOutsider().fpb.createProject({ title: "Theirs", projectType: "dev" });
+    await grantProjectRights(outsiderId);
+    const theirs = await asHead(outsiderId).fpb.createProject({ title: "Theirs", projectType: "dev" });
     const board = await asOutsider().fpb.getBoard({ projectId: theirs.id });
     const columnId = (board.columns[0] as any).id;
 

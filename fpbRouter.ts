@@ -14,6 +14,8 @@ import { TRPCError } from "@trpc/server";
 import { protectedProcedure, router } from "./_core/trpc";
 import * as fpb from "./fpbDb";
 import * as db from "./db";
+import { isOrgWide } from "./roles";
+import { canOpenProjects } from "./departments";
 import { emitNotification } from "./_core/realtime";
 import { storagePut } from "./storage";
 
@@ -25,11 +27,10 @@ const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid id");
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
 
 /**
- * Admins, the creator, or anyone on the project may see and edit it.
+ * Org-wide roles, the creator, or anyone on the project may see and edit it.
  *
- * Anyone can create a space now, so this is also the read gate: a space is
- * private to the people in it, and "adding" someone would mean nothing if
- * outsiders could open it anyway.
+ * This is also the read gate: a project is private to the people in it, and
+ * "adding" someone would mean nothing if outsiders could open it anyway.
  */
 async function requireProjectAccess(
   ctx: { user: { id: string; role?: string } },
@@ -37,7 +38,7 @@ async function requireProjectAccess(
 ) {
   const project = await fpb.getProject(projectId);
   if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-  if (ctx.user.role === "admin") return project;
+  if (isOrgWide(ctx.user.role)) return project;
   const isCreator = String((project as any).createdBy) === ctx.user.id;
   const isMember = ((project as any).memberIds ?? []).includes(ctx.user.id);
   if (!isCreator && !isMember) {
@@ -56,7 +57,7 @@ async function requireProjectOwner(
 ) {
   const project = await fpb.getProject(projectId);
   if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-  if (ctx.user.role === "admin") return project;
+  if (isOrgWide(ctx.user.role)) return project;
   if (String((project as any).createdBy) !== ctx.user.id) {
     throw new TRPCError({
       code: "FORBIDDEN",
@@ -196,13 +197,22 @@ export const fpbRouter = router({
       // they were added to.
       fpb.getProjects({
         ...input,
-        visibleTo: ctx.user.role === "admin" ? undefined : ctx.user.id,
+        visibleTo: isOrgWide(ctx.user.role) ? undefined : ctx.user.id,
       })
     ),
 
   getProject: protectedProcedure
     .input(z.object({ id: objectId }))
     .query(async ({ ctx, input }) => requireProjectAccess(ctx, input.id)),
+
+  /**
+   * Whether the caller may open a project, so the button can be hidden rather
+   * than offered and then refused. The mutation checks this again; this is
+   * only about what to show.
+   */
+  canCreateProjects: protectedProcedure.query(async ({ ctx }) =>
+    canOpenProjects(ctx.user)
+  ),
 
   createProject: protectedProcedure
     .input(
@@ -221,8 +231,17 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      // Anyone can open a space of their own and invite whoever they need;
-      // this is not an admin-only action.
+      // Opening a project is a granted right, not something everyone has.
+      // Org-wide roles always; a department head only once a super admin has
+      // given their department the grant.
+      if (!(await canOpenProjects(ctx.user))) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message:
+            "You do not have permission to create projects. Ask an administrator to grant it to your department.",
+        });
+      }
+
       const project = await fpb.createProject({
         title: input.title,
         columns: input.columns,

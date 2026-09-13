@@ -278,10 +278,42 @@ export async function getUserById(id: string) {
   return sanitizeUser(normalizeDoc(user));
 }
 
-export async function getUserByIdWithSecret(id: string) {
+/**
+ * The two-factor fields sanitizeUser strips, for the sign-in flow that needs
+ * them. Typed explicitly because normalizeDoc widens to `{ id: any }`, and the
+ * callers then read role, email and the secret off a value TypeScript believes
+ * has none of them.
+ */
+export type UserWithSecret = {
+  id: string;
+  name?: string;
+  email?: string;
+  employeeId?: string;
+  role?: string;
+  twoFactorSecret?: string;
+  twoFactorEnabled?: boolean;
+};
+
+export async function getUserByIdWithSecret(
+  id: string
+): Promise<UserWithSecret | undefined> {
   if (!(await optionalDb())) return undefined;
   const user = await User.findById(toObjectId(id)).lean();
-  return normalizeDoc(user);
+  return normalizeDoc(user) as UserWithSecret | undefined;
+}
+
+/**
+ * Changes someone's role. Whether the caller is allowed to set this particular
+ * role is decided by canAssignRole in roles.ts, before this is reached.
+ */
+export async function setUserRole(userId: string, role: string) {
+  await requireDb();
+  const saved = await User.findByIdAndUpdate(
+    toObjectId(userId),
+    { role },
+    { returnDocument: "after" }
+  ).lean();
+  return sanitizeUser(normalizeDoc(saved));
 }
 
 export async function setUserTwoFactorSecret(userId: string, secret: string) {
@@ -460,13 +492,43 @@ export async function createLeaveApplication(leave: {
   startDate: Date;
   endDate: Date;
   reason: string;
+  /** Whoever it is being sent to. Null when there is nobody to route it to. */
+  approverUserId?: string | null;
 }) {
   await requireDb();
+  const { approverUserId, ...rest } = leave;
   const created = await LeaveApplication.create({
-    ...leave,
+    ...rest,
     userId: toObjectId(leave.userId),
+    approverUserId: approverUserId ? toObjectId(approverUserId) : undefined,
   });
   return normalizeDoc(created);
+}
+
+/**
+ * The applications one approver is responsible for.
+ *
+ * Matched on approverUserId rather than on the applicant's current department,
+ * so a request stays with the person it was sent to even if the applicant
+ * moves team while it is pending.
+ */
+export async function getLeaveApplicationsForApprover(approverId: string) {
+  await requireDb();
+  const leaves = await LeaveApplication.find({ approverUserId: toObjectId(approverId) })
+    .sort({ createdAt: -1 })
+    .populate("userId")
+    .lean();
+
+  return leaves.map((leave: any) => ({
+    ...normalizeDoc(leave),
+    user: leave.userId ? normalizeDoc(leave.userId as any) : undefined,
+  }));
+}
+
+export async function getLeaveApplicationById(id: string) {
+  await requireDb();
+  const leave = await LeaveApplication.findById(toObjectId(id)).lean();
+  return normalizeDoc(leave);
 }
 
 export async function getLeaveApplicationsByUser(userId: string) {

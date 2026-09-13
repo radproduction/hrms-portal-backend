@@ -2,6 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import { storagePut } from "./storage";
 import { authenticateRequest } from "./_core/auth";
+import { isOrgWide } from "./roles";
 
 const router = Router();
 const upload = multer({
@@ -28,7 +29,7 @@ router.post("/api/upload-employee-document", upload.single("file"), async (req, 
       return;
     }
 
-    if (user.role !== "admin") {
+    if (!isOrgWide(user.role)) {
       res.status(403).json({ error: "Forbidden" });
       return;
     }

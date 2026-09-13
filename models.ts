@@ -7,13 +7,16 @@ export interface IUser extends Document {
   name?: string;
   email?: string;
   loginMethod?: string;
-  role: 'user' | 'admin';
+  role: 'user' | 'dept_head' | 'head_of_ops' | 'admin';
   employeeId?: string;
   password?: string;
   twoFactorEnabled?: boolean;
   twoFactorSecret?: string;
   avatar?: string;
+  /** Display name, kept for the reports and filters that already group by it. */
   department?: string;
+  /** The department record, which is what resolves to a head. */
+  departmentId?: Types.ObjectId;
   position?: string;
   createdAt: Date;
   updatedAt: Date;
@@ -25,7 +28,14 @@ const userSchema = new Schema<IUser>({
   name: String,
   email: String,
   loginMethod: String,
-  role: { type: String, enum: ['user', 'admin'], default: 'user', required: true },
+  // Four levels, lowest first. roles.ts holds the ordering and the checks;
+  // never compare these strings directly, or adding a level silently locks it
+  // out of everything guarded by an equality test.
+  role: { type: String, enum: ['user', 'dept_head', 'head_of_ops', 'admin'], default: 'user', required: true },
+  // The department this person belongs to. `department` below stays as the
+  // display name so existing reports and filters keep working; this is the one
+  // that resolves to a head.
+  departmentId: { type: Schema.Types.ObjectId, ref: 'Department' },
   employeeId: { type: String, unique: true, sparse: true },
   password: String,
   twoFactorEnabled: { type: Boolean, default: false },
@@ -38,6 +48,39 @@ const userSchema = new Schema<IUser>({
 
 export const User = model<IUser>('User', userSchema);
 
+// ==================== Department Model ====================
+/**
+ * A department and who leads it.
+ *
+ * Departments were only ever a free-text string on each user, so there was
+ * nowhere to record a head - which is what leave approval and the project
+ * board both need. The string stays as the display name; this record is what
+ * answers "who approves for this person".
+ */
+export interface IDepartment extends Document {
+  _id: Types.ObjectId;
+  name: string;
+  headUserId?: Types.ObjectId;
+  /**
+   * Granted by a super admin. Lets this department's head open projects on the
+   * board and staff them; without it they can only work in projects they were
+   * added to.
+   */
+  canCreateProjects: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const departmentSchema = new Schema<IDepartment>({
+  // Unique so two spellings of one department cannot each hold a different
+  // head, leaving it ambiguous who approves.
+  name: { type: String, required: true, unique: true, trim: true },
+  headUserId: { type: Schema.Types.ObjectId, ref: 'User' },
+  canCreateProjects: { type: Boolean, default: false },
+}, { timestamps: true });
+
+export const Department = model<IDepartment>('Department', departmentSchema);
+
 // ==================== Time Entry Model ====================
 export interface ITimeEntry extends Document {
   _id: Types.ObjectId;
@@ -46,6 +89,13 @@ export interface ITimeEntry extends Document {
   timeOut?: Date;
   totalHours?: number;
   status: 'active' | 'completed' | 'early_out';
+  /**
+   * True when the session was closed by the shift sweep rather than by the
+   * person. Their real finishing time is unknown, so the hours on these rows
+   * are a cap, not a measurement - reports and payroll should show them as
+   * needing a human to confirm.
+   */
+  autoClockedOut?: boolean;
   notes?: string;
   location?: {
     lat: number;
@@ -65,6 +115,7 @@ const timeEntrySchema = new Schema<ITimeEntry>({
   timeOut: Date,
   totalHours: Number,
   status: { type: String, enum: ['active', 'completed', 'early_out'], default: 'active', required: true },
+  autoClockedOut: { type: Boolean, default: false },
   notes: String,
   location: {
     lat: Number,
@@ -161,6 +212,8 @@ export interface ILeaveApplication extends Document {
   endDate: Date;
   reason: string;
   status: 'pending' | 'approved' | 'rejected';
+  /** Routed to at submission time: the applicant's department head, or above. */
+  approverUserId?: Types.ObjectId;
   approvedBy?: Types.ObjectId;
   approvedAt?: Date;
   rejectionReason?: string;
@@ -175,6 +228,17 @@ const leaveApplicationSchema = new Schema<ILeaveApplication>({
   endDate: { type: Date, required: true },
   reason: { type: String, required: true },
   status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending', required: true },
+  /**
+   * Who this was sent to when it was submitted: normally the applicant's
+   * department head.
+   *
+   * Recorded rather than worked out on demand, so an application stays with
+   * the person who was actually asked. Recomputing it would quietly hand a
+   * pending request to somebody else the moment the applicant changed
+   * department or a head stepped down.
+   */
+  approverUserId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
+  /** Who decided it. Not necessarily the approver above - anyone org-wide can step in. */
   approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
   approvedAt: Date,
   rejectionReason: String,
