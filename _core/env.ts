@@ -9,4 +9,11 @@ export const ENV = {
   officeRadiusKm: process.env.OFFICE_RADIUS_KM ? Number(process.env.OFFICE_RADIUS_KM) : 0.5,
   wingmanUrl: process.env.WINGMAN_URL ?? "",
   wingmanSecret: process.env.WINGMAN_SECRET ?? "",
+  /** Employee id or email Wingman clocks when a request names nobody. */
+  wingmanDefaultEmployee: process.env.WINGMAN_DEFAULT_EMPLOYEE ?? "",
+  /** How long to wait on Wingman's webhook before giving up. */
+  wingmanTimeoutMs:
+    Number(process.env.WINGMAN_WEBHOOK_TIMEOUT_MS) > 0
+      ? Number(process.env.WINGMAN_WEBHOOK_TIMEOUT_MS)
+      : 5000,
 };

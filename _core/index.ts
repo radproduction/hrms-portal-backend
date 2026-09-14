@@ -11,13 +11,7 @@ import { connectToMongoDB } from "../mongodb";
 import { UPLOADS_DIR } from "../storage";
 import { startShiftSweep } from "../shiftSweep";
 import { initRealtime } from "./realtime";
-import {
-  clockInUser,
-  clockOutUser,
-  getUserByWingmanEmployeeIdentifier,
-  parseWingmanPayload,
-  WorkClockError,
-} from "../wingman";
+import { handleWingmanClock } from "../wingman";
 import { ENV } from "./env";
 
 async function startServer() {
@@ -74,45 +68,20 @@ async function startServer() {
   app.use(avatarUploadRouter);
   // Employee document upload endpoint
   app.use(employeeDocumentUploadRouter);
+  // Wingman, the WhatsApp assistant, clocking someone in or out. Registered
+  // straight on the app ahead of any session auth, because Wingman proves
+  // itself with X-Wingman-Secret instead. The logic lives in wingman.ts.
   app.post("/api/wingman/clock", async (req, res) => {
-    if (!ENV.wingmanSecret) {
-      return res.status(503).json({ ok: false, error: "wingman_not_configured" });
-    }
-
-    if (req.headers["x-wingman-secret"] !== ENV.wingmanSecret) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-
-    const parsed = parseWingmanPayload(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ ok: false, error: "invalid_payload" });
-    }
-
-    const { event, employee, at } = parsed.data;
-    const atDate = at ? new Date(at) : new Date();
-    if (Number.isNaN(atDate.getTime())) {
-      return res.status(400).json({ ok: false, error: "invalid_at" });
-    }
-
-    const user = await getUserByWingmanEmployeeIdentifier(employee);
-    if (!user?.id) {
-      return res.status(404).json({ ok: false, error: "employee_not_found" });
-    }
-
     try {
-      if (event === "clock_in") {
-        await clockInUser(user.id, { at: atDate });
-      } else {
-        await clockOutUser(user.id, { at: atDate });
-      }
-
-      return res.json({ ok: true, at: atDate.toISOString() });
+      const result = await handleWingmanClock(req.headers["x-wingman-secret"], req.body);
+      return res.status(result.status).json(result.body);
     } catch (error) {
-      if (error instanceof WorkClockError) {
-        return res.status(error.statusCode).json({ ok: false, error: error.message });
-      }
-
-      console.error("[Wingman] inbound clock route failed", error);
+      // Express 4 does not catch a rejected handler; without this the request
+      // would hang until Wingman's timeout and read as a failure anyway.
+      console.error(
+        "[Wingman] inbound clock route failed",
+        error instanceof Error ? error.name : "unknown error"
+      );
       return res.status(500).json({ ok: false, error: "internal_error" });
     }
   });
