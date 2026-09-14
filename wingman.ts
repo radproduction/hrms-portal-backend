@@ -208,24 +208,31 @@ export async function handleWingmanClock(
 /**
  * Tells Wingman a real clock happened, so it can chase a forgotten clock-out.
  *
- * Best effort and bounded. It never throws, and it gives up after
- * WINGMAN_WEBHOOK_TIMEOUT_MS so an unreachable Wingman cannot leave requests
- * hanging. It used to be awaited with no timeout, which put the person's own
- * clock-in at the mercy of Wingman's response time.
+ * WINGMAN_URL is a shared company endpoint now, not a per-user token URL, so
+ * two things follow. The body must say who clocked, by their company email -
+ * which is what Wingman matches on, so the email is sent in preference to the
+ * employee id (that is usually just a name). And the endpoint has no token to
+ * authenticate it, so the shared secret goes in X-Wingman-Secret, the same
+ * header Wingman authenticates itself to us with.
  *
- * WINGMAN_URL carries a private token and this repository is public, so the
- * URL is never logged: failures report the status or the error's name only.
+ * Best effort and bounded: it never throws, and gives up after
+ * WINGMAN_WEBHOOK_TIMEOUT_MS so an unreachable Wingman cannot hang the
+ * person's own clock. Neither the secret nor the URL is ever logged - this
+ * repository is public - so failures report the status or the error name only.
  */
 export async function notifyWingman(event: "clock_in" | "clock_out", userId: string, at: Date) {
   if (!ENV.wingmanUrl) return;
 
   try {
     const user = await db.getUserById(userId);
-    const employee = user?.employeeId || user?.email || userId;
+    const employee = user?.email || user?.employeeId || userId;
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ENV.wingmanSecret) headers["X-Wingman-Secret"] = ENV.wingmanSecret;
 
     const response = await fetch(ENV.wingmanUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
       body: JSON.stringify({ event, employee, at: at.toISOString() }),
       signal: AbortSignal.timeout(ENV.wingmanTimeoutMs),
     });

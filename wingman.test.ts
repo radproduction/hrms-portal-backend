@@ -22,11 +22,13 @@ afterEach(() => {
 /** A stand-in for Wingman's webhook that records what it receives. */
 async function startHook(mode: "ok" | "hang" | "500") {
   const hits: Record<string, unknown>[] = [];
+  const headers: http.IncomingHttpHeaders[] = [];
   const sockets = new Set<Socket>();
   const server = http.createServer((req, res) => {
     let raw = "";
     req.on("data", chunk => (raw += chunk));
     req.on("end", () => {
+      headers.push(req.headers);
       try { hits.push(JSON.parse(raw || "{}")); } catch { hits.push({}); }
       if (mode === "hang") return;
       res.statusCode = mode === "500" ? 500 : 200;
@@ -41,8 +43,9 @@ async function startHook(mode: "ok" | "hang" | "500") {
   const { port } = server.address() as AddressInfo;
 
   return {
-    url: `http://127.0.0.1:${port}/work/event/${TOKEN}`,
+    url: `http://127.0.0.1:${port}/work/company-event`,
     hits,
+    headers,
     async waitForHits(count: number, ms = 3000) {
       const until = Date.now() + ms;
       while (hits.length < count && Date.now() < until) {
@@ -229,13 +232,18 @@ describeWithDb("Wingman clock, against the database", () => {
 
   // ------------------------------------------------------- outbound webhook
 
-  it("tells Wingman when someone clocks in through the portal", async () => {
+  it("tells Wingman when someone clocks in, identifying them by company email", async () => {
     const hook = await startHook("ok");
     try {
-      configure({ wingmanUrl: hook.url });
+      // The shared company endpoint matches on email, and authenticates the
+      // webhook by the secret header.
+      configure({ wingmanUrl: hook.url, wingmanSecret: SECRET });
       await clockInUser(userId);
       await hook.waitForHits(1);
-      expect(hook.hits[0]).toMatchObject({ event: "clock_in", employee: employeeId });
+      expect(hook.hits[0]).toMatchObject({ event: "clock_in", employee: email });
+      // Not the employee id, which for real people is just their name.
+      expect(hook.hits[0].employee).not.toBe(employeeId);
+      expect(hook.headers[0]["x-wingman-secret"]).toBe(SECRET);
     } finally {
       await hook.close();
     }
@@ -284,20 +292,21 @@ describeWithDb("Wingman clock, against the database", () => {
     }
   });
 
-  it("never writes the private webhook token to the logs", async () => {
+  it("never writes the secret or the URL token to the logs", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+    configure({ wingmanSecret: SECRET });
 
     for (const mode of ["500", "hang"] as const) {
       const hook = await startHook(mode);
       try {
-        configure({ wingmanUrl: hook.url, wingmanTimeoutMs: 300 });
+        configure({ wingmanUrl: hook.url, wingmanSecret: SECRET, wingmanTimeoutMs: 300 });
         await notifyWingman("clock_in", userId, new Date());
       } finally {
         await hook.close();
       }
     }
-    // An address nothing is listening on.
-    configure({ wingmanUrl: `http://127.0.0.1:1/work/event/${TOKEN}`, wingmanTimeoutMs: 300 });
+    // An address nothing is listening on, with a token in the path for good measure.
+    configure({ wingmanUrl: `http://127.0.0.1:1/work/event/${TOKEN}`, wingmanSecret: SECRET, wingmanTimeoutMs: 300 });
     await notifyWingman("clock_in", userId, new Date());
 
     expect(spy).toHaveBeenCalled();
@@ -306,5 +315,7 @@ describeWithDb("Wingman clock, against the database", () => {
       .map(arg => (arg instanceof Error ? `${arg.message} ${arg.stack}` : String(arg)))
       .join("\n");
     expect(logged).not.toContain(TOKEN);
+    // The secret now travels as a header, so it too must never surface in a log.
+    expect(logged).not.toContain(SECRET);
   });
 });
