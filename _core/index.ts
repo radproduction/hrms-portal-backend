@@ -11,7 +11,7 @@ import { connectToMongoDB } from "../mongodb";
 import { UPLOADS_DIR } from "../storage";
 import { startShiftSweep } from "../shiftSweep";
 import { initRealtime } from "./realtime";
-import { handleWingmanClock } from "../wingman";
+import { handleWingmanClock, handleWingmanEmployeeData } from "../wingman";
 import { ENV } from "./env";
 
 async function startServer() {
@@ -80,6 +80,23 @@ async function startServer() {
       // would hang until Wingman's timeout and read as a failure anyway.
       console.error(
         "[Wingman] inbound clock route failed",
+        error instanceof Error ? error.name : "unknown error"
+      );
+      return res.status(500).json({ ok: false, error: "internal_error" });
+    }
+  });
+  // Wingman reading one employee's snapshot (clock, hours, tasks, projects,
+  // leaves) for briefings and questions. Same X-Wingman-Secret gate; read-only.
+  app.get("/api/wingman/employee-data", async (req, res) => {
+    try {
+      const result = await handleWingmanEmployeeData(
+        req.headers["x-wingman-secret"],
+        req.query as Record<string, unknown>
+      );
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error(
+        "[Wingman] employee-data route failed",
         error instanceof Error ? error.name : "unknown error"
       );
       return res.status(500).json({ ok: false, error: "internal_error" });

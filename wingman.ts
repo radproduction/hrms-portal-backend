@@ -205,6 +205,127 @@ export async function handleWingmanClock(
   }
 }
 
+// ── Read snapshot: Wingman pulls one employee's current HRMS state ──────
+//   Phase 2. Wingman polls this (with the shared secret) to build daily
+//   briefings and answer questions like "kitni chhutti bachi?" / "aaj ke
+//   tasks?". Read-only, and only ever this one employee's own data, routed by
+//   the same company email the clock and event webhooks use.
+
+function startOfTodayLocal(now = new Date()) {
+  const d = new Date(now);
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+/** Monday as the start of the week (Pakistan working week). */
+function startOfWeekLocal(now = new Date()) {
+  const d = startOfTodayLocal(now);
+  const diff = (d.getDay() + 6) % 7; // 0 = Monday
+  d.setDate(d.getDate() - diff);
+  return d;
+}
+
+/** Sum worked hours: finished entries by totalHours, an open one by elapsed. */
+function sumHours(entries: any[], now = new Date()) {
+  let total = 0;
+  for (const e of entries ?? []) {
+    if (typeof e?.totalHours === "number") total += e.totalHours;
+    else if (e?.status === "active" && e?.timeIn) {
+      total += (now.getTime() - new Date(e.timeIn).getTime()) / 3_600_000;
+    }
+  }
+  return Math.round(total * 100) / 100;
+}
+
+export type WingmanEmployeeDataResponse = { status: number; body: any };
+
+/**
+ * GET /api/wingman/employee-data?employee=<email> - one employee's snapshot.
+ * Same secret + no-Express shape as handleWingmanClock, so it is unit-testable.
+ */
+export async function handleWingmanEmployeeData(
+  secretHeader: string | string[] | undefined,
+  query: Record<string, unknown>
+): Promise<WingmanEmployeeDataResponse> {
+  if (!ENV.wingmanSecret) {
+    return { status: 503, body: { ok: false, error: "wingman_not_configured" } };
+  }
+
+  const provided = Array.isArray(secretHeader) ? secretHeader[0] : secretHeader;
+  if (!secretMatches(provided, ENV.wingmanSecret)) {
+    return { status: 401, body: { ok: false, error: "unauthorized" } };
+  }
+
+  const employee =
+    (typeof query.employee === "string" && query.employee) || ENV.wingmanDefaultEmployee;
+  if (!employee) {
+    return { status: 400, body: { ok: false, error: "employee_required" } };
+  }
+
+  const user = await getUserByWingmanEmployeeIdentifier(employee);
+  if (!user?.id) {
+    return { status: 404, body: { ok: false, error: "employee_not_found" } };
+  }
+
+  const now = new Date();
+  const [active, todayEntries, weekEntries, tasksRaw, projectsRaw, leavesRaw] = await Promise.all([
+    db.getActiveTimeEntry(user.id),
+    db.getTimeEntriesByDateRange(user.id, startOfTodayLocal(now), now),
+    db.getTimeEntriesByDateRange(user.id, startOfWeekLocal(now), now),
+    db.getTasksByEmployee(user.id),
+    db.getUserProjects(user.id),
+    db.getLeaveApplicationsByUser(user.id),
+  ]);
+
+  const openTasks = (tasksRaw as any[])
+    .filter(t => t && t.status !== "completed")
+    .map(t => ({
+      title: t.title ?? "",
+      status: t.status ?? "todo",
+      priority: t.priority ?? "medium",
+      due: t.completionDate ? new Date(t.completionDate).toISOString() : null,
+      project: t.project?.name ?? null,
+    }));
+
+  const projects = (projectsRaw as any[])
+    .filter(p => p && p.status !== "completed" && p.status !== "archived")
+    .map(p => ({ name: p.name ?? "", status: p.status ?? "active", priority: p.priority ?? "medium" }));
+
+  const leaves = (leavesRaw as any[]) ?? [];
+  const pendingLeaves = leaves.filter(l => l?.status === "pending");
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      employee: user.email ?? employee,
+      name: user.name ?? null,
+      clock: {
+        clocked_in: Boolean(active),
+        since: (active as any)?.timeIn ? new Date((active as any).timeIn).toISOString() : null,
+      },
+      hours: {
+        today: sumHours(todayEntries as any[], now),
+        week: sumHours(weekEntries as any[], now),
+      },
+      tasks: {
+        open: openTasks.length,
+        items: openTasks.slice(0, 20),
+      },
+      projects,
+      leaves: {
+        pending: pendingLeaves.length,
+        items: leaves.slice(0, 5).map(l => ({
+          type: l.leaveType ?? null,
+          status: l.status ?? null,
+          start: l.startDate ? new Date(l.startDate).toISOString() : null,
+          end: l.endDate ? new Date(l.endDate).toISOString() : null,
+        })),
+      },
+    },
+  };
+}
+
 /**
  * Tells Wingman a real clock happened, so it can chase a forgotten clock-out.
  *
