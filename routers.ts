@@ -9,7 +9,7 @@ import { createSessionToken, setSessionCookie, verifySessionToken } from "./_cor
 import { authenticator } from "otplib";
 import { toDataURL } from "qrcode";
 import { emitChatMessage, emitNotification, emitAnnouncement, emitPayslip } from "./_core/realtime";
-import { clockInUser, clockOutUser, WorkClockError } from "./wingman";
+import { clockInUser, clockOutUser, notifyWingmanEvent, WorkClockError } from "./wingman";
 import { computePayslipAmounts, formatPayPeriod } from "./payroll";
 import {
   getMonthRange,
@@ -22,6 +22,55 @@ import { storageDelete } from "./storage";
 import { isAnyHead, isOrgWide, isSuperAdmin, canAssignRole, assignableRoles, ROLE_LABELS } from "./roles";
 import * as departments from "./departments";
 import { routeLeaveFor } from "./leaveRouting";
+
+/**
+ * Tells each assignee of a legacy project task that it was assigned to them -
+ * in the app and, best-effort, on WhatsApp through Wingman.
+ *
+ * The two task-creation procedures both went through db.createProjectTask,
+ * which validates, de-duplicates and (with no assignees) falls back to the
+ * creator, so the people actually notified are read off the stored task rather
+ * than off the raw input. The person who created the task is never notified of
+ * their own action. A failed notification never rolls back the task.
+ */
+async function notifyTaskAssignees(
+  task: { id?: string; title?: unknown; assigneeIds?: unknown; completionDate?: unknown },
+  actorId: string
+) {
+  const assigneeIds = Array.isArray(task.assigneeIds) ? (task.assigneeIds as string[]) : [];
+  const title = typeof task.title === "string" ? task.title : "a task";
+  const due =
+    task.completionDate instanceof Date
+      ? task.completionDate.toISOString()
+      : typeof task.completionDate === "string"
+        ? task.completionDate
+        : undefined;
+
+  for (const userId of [...new Set(assigneeIds)]) {
+    if (!userId || userId === actorId) continue;
+    try {
+      await db.createNotification({
+        userId,
+        type: "task_assigned",
+        title: "New task assigned",
+        message: `You've been assigned: ${title}`,
+        priority: "medium",
+        relatedId: task.id,
+        relatedType: "task",
+      });
+      emitNotification({ userId });
+      void notifyWingmanEvent(userId, {
+        type: "task_assigned",
+        title: "New task assigned",
+        message: `You've been assigned: ${title}`,
+        taskTitle: title,
+        due,
+      });
+    } catch (error) {
+      console.error("[Tasks] failed to notify assignee", userId, error);
+    }
+  }
+}
 
 export const appRouter = router({
   system: systemRouter,
@@ -768,6 +817,9 @@ export const appRouter = router({
           completionDate: input.completionDate,
         });
 
+        // Tell whoever the task was assigned to; previously nothing did.
+        await notifyTaskAssignees(created as any, ctx.user.id);
+
         return { success: true, task: created };
       }),
 
@@ -1080,6 +1132,14 @@ export const appRouter = router({
               relatedType: "leave",
             });
             emitNotification({ userId: applicantId });
+            void notifyWingmanEvent(applicantId, {
+              type: input.status === "approved" ? "leave_approved" : "leave_rejected",
+              title: input.status === "approved" ? "Leave approved" : "Leave rejected",
+              message:
+                input.status === "approved"
+                  ? `Your leave request has been approved by ${ctx.user.name ?? "your approver"}.`
+                  : `Your leave request was rejected: ${input.rejectionReason || "no reason given"}.`,
+            });
           } catch (error) {
             console.error("[Leave] could not notify the applicant", error);
           }
@@ -1154,6 +1214,10 @@ export const appRouter = router({
           assigneeIds: input.assigneeIds,
           completionDate: input.completionDate,
         });
+
+        // The whole point of Phase 1: the assignee learns they have a task.
+        await notifyTaskAssignees(created as any, ctx.user.id);
+
         return { success: true, task: created };
       }),
 
@@ -1277,6 +1341,12 @@ export const appRouter = router({
             relatedType: "project",
           });
           emitNotification({ userId });
+          void notifyWingmanEvent(userId, {
+            type: "project_assigned",
+            title: "New project assigned",
+            message: `You have been assigned to ${input.name}.`,
+            projectName: input.name,
+          });
         }
         return { success: true, projectId };
       }),
@@ -1498,6 +1568,13 @@ export const appRouter = router({
 
         emitNotification({ userId: input.userId });
         emitPayslip({ userId: input.userId });
+        void notifyWingmanEvent(input.userId, {
+          type: "payslip_issued",
+          title: wasReplaced ? `Payslip updated for ${period}` : `Payslip available for ${period}`,
+          message: wasReplaced
+            ? `Your ${period} payslip has been updated. Net salary: PKR ${amounts.netSalary.toLocaleString()}.`
+            : `Your ${period} payslip is now available. Net salary: PKR ${amounts.netSalary.toLocaleString()}.`,
+        });
 
         return { success: true, payslip, wasReplaced };
       }),
@@ -1539,6 +1616,11 @@ export const appRouter = router({
             relatedType: "payslip",
           });
           emitNotification({ userId: employeeId });
+          void notifyWingmanEvent(employeeId, {
+            type: "payslip_issued",
+            title: `Salary paid for ${period}`,
+            message: `Your ${period} salary of PKR ${netSalary.toLocaleString()} has been marked as paid.`,
+          });
         }
 
         emitPayslip({ userId: employeeId });

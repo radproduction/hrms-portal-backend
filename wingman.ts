@@ -245,3 +245,64 @@ export async function notifyWingman(event: "clock_in" | "clock_out", userId: str
     console.error(`[Wingman] ${event} webhook did not complete (${name})`);
   }
 }
+
+/**
+ * One of the employee notifications Wingman is allowed to forward to WhatsApp.
+ * `type` mirrors the in-app notification type; the rest is what Wingman needs
+ * to phrase the message.
+ */
+export type WingmanEvent = {
+  type: "project_assigned" | "task_assigned" | "leave_approved" | "leave_rejected" | "payslip_issued";
+  title: string;
+  message: string;
+  due?: string;
+  projectName?: string;
+  taskTitle?: string;
+};
+
+/**
+ * Forwards one employee notification to Wingman's company endpoint, so it can
+ * message the person on WhatsApp. Called alongside createNotification, never
+ * instead of it: the in-app notification is the record, this is the nudge.
+ *
+ * Same shape as notifyWingman - shared secret in the header, best effort,
+ * bounded by the timeout, never throws, and never logs the secret or URL
+ * because this repository is public. Wingman answers { ok, linked }; linked
+ * false just means that employee has not connected WhatsApp yet, which is not
+ * an error and nothing here needs to act on.
+ */
+export async function notifyWingmanEvent(userId: string, event: WingmanEvent): Promise<void> {
+  if (!ENV.wingmanNotifyUrl) return;
+
+  try {
+    const user = await db.getUserById(userId);
+    const employee = user?.email;
+    // Wingman routes purely by email; with none there is nothing to send.
+    if (!employee) return;
+
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (ENV.wingmanSecret) headers["X-Wingman-Secret"] = ENV.wingmanSecret;
+
+    const response = await fetch(ENV.wingmanNotifyUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        employee,
+        type: event.type,
+        title: event.title,
+        message: event.message,
+        due: event.due,
+        projectName: event.projectName,
+        taskTitle: event.taskTitle,
+      }),
+      signal: AbortSignal.timeout(ENV.wingmanTimeoutMs),
+    });
+
+    if (!response.ok) {
+      console.error(`[Wingman] notify ${event.type} failed with HTTP ${response.status}`);
+    }
+  } catch (error) {
+    const name = error instanceof Error ? error.name : "unknown error";
+    console.error(`[Wingman] notify ${event.type} did not complete (${name})`);
+  }
+}
