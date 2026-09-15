@@ -8,6 +8,8 @@ export const ENV = {
   officeLng: process.env.OFFICE_LNG ? Number(process.env.OFFICE_LNG) : null,
   officeRadiusKm: process.env.OFFICE_RADIUS_KM ? Number(process.env.OFFICE_RADIUS_KM) : 0.5,
   wingmanUrl: process.env.WINGMAN_URL ?? "",
+  /** Company endpoint Wingman gives for forwarding employee notifications. */
+  wingmanNotifyUrl: process.env.WINGMAN_NOTIFY_URL ?? "",
   wingmanSecret: process.env.WINGMAN_SECRET ?? "",
   /** Employee id or email Wingman clocks when a request names nobody. */
   wingmanDefaultEmployee: process.env.WINGMAN_DEFAULT_EMPLOYEE ?? "",

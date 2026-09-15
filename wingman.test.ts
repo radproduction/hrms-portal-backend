@@ -4,7 +4,7 @@ import type { AddressInfo, Socket } from "node:net";
 import mongoose from "mongoose";
 import { ENV } from "./_core/env";
 import { TimeEntry, User } from "./models";
-import { clockInUser, handleWingmanClock, notifyWingman } from "./wingman";
+import { clockInUser, handleWingmanClock, notifyWingman, notifyWingmanEvent } from "./wingman";
 import { describeWithDb } from "./test-utils";
 
 const SECRET = "wm-test-secret-0123456789abcdef";
@@ -292,6 +292,61 @@ describeWithDb("Wingman clock, against the database", () => {
     }
   });
 
+  // --------------------------------------------------- notification forwarding
+
+  it("forwards an employee notification with the email, secret and fields", async () => {
+    const hook = await startHook("ok");
+    try {
+      configure({ wingmanNotifyUrl: hook.url, wingmanSecret: SECRET });
+      await notifyWingmanEvent(userId, {
+        type: "task_assigned",
+        title: "New task assigned",
+        message: "You've been assigned: Ship it",
+        taskTitle: "Ship it",
+        due: "2026-10-01T00:00:00.000Z",
+      });
+      await hook.waitForHits(1);
+
+      expect(hook.hits[0]).toMatchObject({
+        employee: email,
+        type: "task_assigned",
+        title: "New task assigned",
+        message: "You've been assigned: Ship it",
+        taskTitle: "Ship it",
+        due: "2026-10-01T00:00:00.000Z",
+      });
+      expect(hook.headers[0]["x-wingman-secret"]).toBe(SECRET);
+    } finally {
+      await hook.close();
+    }
+  });
+
+  it("does not send when the person has no email to route by", async () => {
+    const noEmail = await User.create({
+      openId: `wm-noemail-${stamp}`, name: "No Email", role: "user", employeeId: `WMNE${stamp}`,
+    });
+    const hook = await startHook("ok");
+    try {
+      configure({ wingmanNotifyUrl: hook.url, wingmanSecret: SECRET });
+      await notifyWingmanEvent(String(noEmail._id), {
+        type: "leave_approved", title: "Leave approved", message: "ok",
+      });
+      await new Promise(r => setTimeout(r, 300));
+      expect(hook.hits).toHaveLength(0);
+    } finally {
+      await hook.close();
+      await User.deleteMany({ _id: noEmail._id });
+    }
+  });
+
+  it("does nothing when no notify URL is configured", async () => {
+    configure({ wingmanNotifyUrl: "", wingmanSecret: SECRET });
+    // Simply must not throw.
+    await expect(
+      notifyWingmanEvent(userId, { type: "payslip_issued", title: "t", message: "m" })
+    ).resolves.toBeUndefined();
+  });
+
   it("never writes the secret or the URL token to the logs", async () => {
     const spy = vi.spyOn(console, "error").mockImplementation(() => {});
     configure({ wingmanSecret: SECRET });
@@ -306,8 +361,15 @@ describeWithDb("Wingman clock, against the database", () => {
       }
     }
     // An address nothing is listening on, with a token in the path for good measure.
-    configure({ wingmanUrl: `http://127.0.0.1:1/work/event/${TOKEN}`, wingmanSecret: SECRET, wingmanTimeoutMs: 300 });
+    configure({
+      wingmanUrl: `http://127.0.0.1:1/work/event/${TOKEN}`,
+      wingmanNotifyUrl: `http://127.0.0.1:1/work/company-notify/${TOKEN}`,
+      wingmanSecret: SECRET,
+      wingmanTimeoutMs: 300,
+    });
     await notifyWingman("clock_in", userId, new Date());
+    // The notification path carries the same secret header, so it must scrub too.
+    await notifyWingmanEvent(userId, { type: "task_assigned", title: "t", message: "m" });
 
     expect(spy).toHaveBeenCalled();
     const logged = spy.mock.calls
