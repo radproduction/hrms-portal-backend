@@ -2,6 +2,7 @@ import crypto from "node:crypto";
 import { z } from "zod";
 import * as db from "./db";
 import { ENV } from "./_core/env";
+import { isOrgWide } from "./roles";
 
 export type WorkClockLocation = {
   lat: number;
@@ -322,6 +323,72 @@ export async function handleWingmanEmployeeData(
           end: l.endDate ? new Date(l.endDate).toISOString() : null,
         })),
       },
+    },
+  };
+}
+
+// ── Manager team snapshot: who's in, out, on break, on leave ────────────
+//   Phase 4b. Only an org-wide role (admin / head of ops) may pull this — the
+//   shared secret proves the request is from Wingman, but the REQUESTING
+//   employee must themselves be a manager, or a regular employee could read the
+//   whole team's status through their own linked account.
+
+export type WingmanTeamSnapshotResponse = { status: number; body: any };
+
+export async function handleWingmanTeamSnapshot(
+  secretHeader: string | string[] | undefined,
+  query: Record<string, unknown>
+): Promise<WingmanTeamSnapshotResponse> {
+  if (!ENV.wingmanSecret) {
+    return { status: 503, body: { ok: false, error: "wingman_not_configured" } };
+  }
+
+  const provided = Array.isArray(secretHeader) ? secretHeader[0] : secretHeader;
+  if (!secretMatches(provided, ENV.wingmanSecret)) {
+    return { status: 401, body: { ok: false, error: "unauthorized" } };
+  }
+
+  const employee =
+    (typeof query.employee === "string" && query.employee) || ENV.wingmanDefaultEmployee;
+  if (!employee) {
+    return { status: 400, body: { ok: false, error: "employee_required" } };
+  }
+
+  const user = await getUserByWingmanEmployeeIdentifier(employee);
+  if (!user?.id) {
+    return { status: 404, body: { ok: false, error: "employee_not_found" } };
+  }
+  if (!isOrgWide((user as any).role)) {
+    return { status: 403, body: { ok: false, error: "not_a_manager" } };
+  }
+
+  const team = (await db.getEmployeeStatusSnapshot()) as any[];
+  const counts = team.reduce(
+    (acc, m) => {
+      if (m.status === "timed_in") acc.in += 1;
+      else if (m.status === "on_break") acc.on_break += 1;
+      else if (m.status === "on_leave") acc.on_leave += 1;
+      else acc.offline += 1;
+      return acc;
+    },
+    { in: 0, on_break: 0, on_leave: 0, offline: 0 }
+  );
+
+  return {
+    status: 200,
+    body: {
+      ok: true,
+      manager: user.email ?? employee,
+      total: team.length,
+      counts,
+      team: team.map(m => ({
+        name: m.name,
+        designation: m.designation,
+        status: m.status, // timed_in | on_break | on_leave | offline
+        since: m.timeIn ? new Date(m.timeIn).toISOString() : null,
+        hours: m.hours ?? null,
+        where: m.locationTag ?? null, // office | remote | null
+      })),
     },
   };
 }

@@ -11,7 +11,7 @@ import { connectToMongoDB } from "../mongodb";
 import { UPLOADS_DIR } from "../storage";
 import { startShiftSweep } from "../shiftSweep";
 import { initRealtime } from "./realtime";
-import { handleWingmanClock, handleWingmanEmployeeData } from "../wingman";
+import { handleWingmanClock, handleWingmanEmployeeData, handleWingmanTeamSnapshot } from "../wingman";
 import { ENV } from "./env";
 
 async function startServer() {
@@ -97,6 +97,23 @@ async function startServer() {
     } catch (error) {
       console.error(
         "[Wingman] employee-data route failed",
+        error instanceof Error ? error.name : "unknown error"
+      );
+      return res.status(500).json({ ok: false, error: "internal_error" });
+    }
+  });
+  // Wingman reading a MANAGER's team snapshot (who's in/out/on break/on leave).
+  // Same secret gate; the endpoint additionally checks the caller is org-wide.
+  app.get("/api/wingman/team-snapshot", async (req, res) => {
+    try {
+      const result = await handleWingmanTeamSnapshot(
+        req.headers["x-wingman-secret"],
+        req.query as Record<string, unknown>
+      );
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error(
+        "[Wingman] team-snapshot route failed",
         error instanceof Error ? error.name : "unknown error"
       );
       return res.status(500).json({ ok: false, error: "internal_error" });
