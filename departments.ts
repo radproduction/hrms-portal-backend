@@ -7,7 +7,7 @@
  * already group by; this module owns the record that resolves to a head.
  */
 import mongoose, { Types } from "mongoose";
-import { Department, User } from "./models";
+import { Department, LeaveApplication, TimeEntry, User } from "./models";
 import { connectToMongoDB } from "./mongodb";
 import { hasRank, isOrgWide } from "./roles";
 
@@ -215,6 +215,137 @@ export async function departmentsLedBy(userId: string): Promise<string[]> {
   await requireDb();
   const led = await Department.find({ headUserId: toId(userId) }, { _id: 1 }).lean();
   return led.map(d => String(d._id));
+}
+
+export type TeamMemberOverview = {
+  id: string;
+  name: string;
+  employeeId: string;
+  email: string;
+  position: string;
+  role: string;
+  departmentId: string | null;
+  departmentName: string | null;
+  isHead: boolean;
+  /** ISO time the current open session started, or null when clocked out. */
+  clockedInSince: string | null;
+  /** Raw entries for this member in the window, for the summariser. */
+  entries: {
+    userId: string;
+    timeIn: Date;
+    timeOut: Date | null;
+    totalHours: number | null;
+    status: string;
+    autoClockedOut: boolean;
+  }[];
+  leaveDates: { startDate: Date; endDate: Date }[];
+  pendingLeaveCount: number;
+};
+
+/**
+ * Everything a "my team" view needs, scoped to a set of departments, in a
+ * handful of queries rather than one per member. The caller (team router)
+ * decides which departments are in scope; this does not itself check who is
+ * asking.
+ *
+ * Unlike getAttendanceReportData this is not limited to role "user" - a team
+ * can contain someone who is also an admin, and the head still needs to see
+ * them - and it carries autoClockedOut so a forgotten clock-out still shows.
+ */
+export async function getTeamOverviewData(
+  departmentIds: string[],
+  windowStart: Date,
+  windowEnd: Date
+): Promise<{ departments: { id: string; name: string }[]; members: TeamMemberOverview[] }> {
+  await requireDb();
+
+  const validIds = departmentIds.filter(id => mongoose.isValidObjectId(id)).map(toId);
+  if (validIds.length === 0) return { departments: [], members: [] };
+
+  const departments = await Department.find({ _id: { $in: validIds } }).lean();
+  const deptById = new Map(departments.map(d => [String(d._id), d]));
+  const headByDept = new Map(
+    departments.filter(d => d.headUserId).map(d => [String(d._id), String(d.headUserId)])
+  );
+
+  const users = await User.find({ departmentId: { $in: validIds } }).sort({ name: 1 }).lean();
+  if (users.length === 0) {
+    return {
+      departments: departments.map(d => ({ id: String(d._id), name: d.name })),
+      members: [],
+    };
+  }
+  const userIds = users.map(u => u._id);
+
+  const [entries, activeEntries, monthLeaves, pendingLeaves] = await Promise.all([
+    TimeEntry.find({
+      userId: { $in: userIds },
+      timeIn: { $gte: windowStart, $lte: windowEnd },
+    }).sort({ timeIn: 1 }).lean(),
+    TimeEntry.find({ userId: { $in: userIds }, status: "active" }).lean(),
+    LeaveApplication.find({
+      userId: { $in: userIds },
+      status: "approved",
+      startDate: { $lte: windowEnd },
+      endDate: { $gte: windowStart },
+    }).lean(),
+    LeaveApplication.find({ userId: { $in: userIds }, status: "pending" }, { userId: 1 }).lean(),
+  ]);
+
+  const entriesByUser = new Map<string, any[]>();
+  for (const e of entries) {
+    const key = String(e.userId);
+    (entriesByUser.get(key) ?? entriesByUser.set(key, []).get(key)!).push(e);
+  }
+  const activeSince = new Map<string, Date>();
+  for (const e of activeEntries) activeSince.set(String(e.userId), e.timeIn as Date);
+  const leavesByUser = new Map<string, any[]>();
+  for (const l of monthLeaves) {
+    const key = String(l.userId);
+    (leavesByUser.get(key) ?? leavesByUser.set(key, []).get(key)!).push(l);
+  }
+  const pendingByUser = new Map<string, number>();
+  for (const l of pendingLeaves) {
+    const key = String(l.userId);
+    pendingByUser.set(key, (pendingByUser.get(key) ?? 0) + 1);
+  }
+
+  const members: TeamMemberOverview[] = users.map(u => {
+    const id = String(u._id);
+    const deptId = u.departmentId ? String(u.departmentId) : null;
+    const dept = deptId ? deptById.get(deptId) : null;
+    const since = activeSince.get(id);
+    return {
+      id,
+      name: u.name ?? "",
+      employeeId: u.employeeId ?? "",
+      email: u.email ?? "",
+      position: u.position ?? "",
+      role: u.role ?? "user",
+      departmentId: deptId,
+      departmentName: dept?.name ?? null,
+      isHead: deptId ? headByDept.get(deptId) === id : false,
+      clockedInSince: since ? new Date(since).toISOString() : null,
+      entries: (entriesByUser.get(id) ?? []).map((e: any) => ({
+        userId: id,
+        timeIn: e.timeIn,
+        timeOut: e.timeOut ?? null,
+        totalHours: e.totalHours ?? null,
+        status: e.status,
+        autoClockedOut: Boolean(e.autoClockedOut),
+      })),
+      leaveDates: (leavesByUser.get(id) ?? []).map((l: any) => ({
+        startDate: l.startDate,
+        endDate: l.endDate,
+      })),
+      pendingLeaveCount: pendingByUser.get(id) ?? 0,
+    };
+  });
+
+  return {
+    departments: departments.map(d => ({ id: String(d._id), name: d.name })),
+    members,
+  };
 }
 
 /**

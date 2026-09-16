@@ -78,7 +78,80 @@ export const appRouter = router({
   // Flow Project Board (Kanban). Separate from the legacy `projects` router
   // below, which still backs the dashboard, reports and the clock-out flow.
   fpb: fpbRouter,
-  
+
+  // A department head's window onto their own team. Everything else a head can
+  // reach is org-wide and refuses them; this is scoped to the departments they
+  // actually lead, so they finally see their people's clock and hours.
+  team: router({
+    getOverview: protectedProcedure
+      .input(z.object({ departmentId: z.string().optional() }).optional())
+      .query(async ({ ctx, input }) => {
+        let deptIds: string[];
+        if (isOrgWide(ctx.user.role)) {
+          deptIds = input?.departmentId
+            ? [input.departmentId]
+            : (await departments.listDepartments()).map(d => d.id);
+        } else if (isAnyHead(ctx.user.role)) {
+          const led = await departments.departmentsLedBy(ctx.user.id);
+          if (input?.departmentId && !led.includes(input.departmentId)) {
+            throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
+          }
+          deptIds = input?.departmentId ? [input.departmentId] : led;
+        } else {
+          throw new TRPCError({ code: "FORBIDDEN", message: "Not permitted" });
+        }
+
+        // Current month in office-local terms, so a late-night query near a
+        // month boundary lands on the day people actually worked.
+        const now = new Date();
+        const todayKey = localDateKey(now);
+        const [year, month] = todayKey.split("-").map(Number);
+        const { start, end } = getMonthRange(month, year);
+
+        const data = await departments.getTeamOverviewData(deptIds, start, end);
+
+        const members = data.members.map(member => {
+          const leaveDates = new Set<string>();
+          for (const lv of member.leaveDates) {
+            leaveDatesInMonth(new Date(lv.startDate), new Date(lv.endDate), month, year)
+              .forEach(d => leaveDates.add(d));
+          }
+          const summary = summarizeEmployeeMonth({
+            employee: {
+              id: member.id,
+              name: member.name,
+              employeeId: member.employeeId,
+              department: member.departmentName ?? undefined,
+            },
+            entries: member.entries,
+            leaveDates,
+            month,
+            year,
+            todayKey,
+          });
+          return {
+            id: member.id,
+            name: member.name,
+            position: member.position,
+            email: member.email,
+            role: member.role,
+            departmentName: member.departmentName,
+            isHead: member.isHead,
+            clockedInSince: member.clockedInSince,
+            pendingLeaveCount: member.pendingLeaveCount,
+            presentDays: summary.presentDays,
+            absentDays: summary.absentDays,
+            leaveDays: summary.leaveDays,
+            totalHours: summary.totalHours,
+            overtimeHours: summary.overtimeHours,
+            missingClockOuts: summary.missingClockOuts,
+          };
+        });
+
+        return { period: { month, year }, departments: data.departments, members };
+      }),
+  }),
+
   auth: router({
     me: publicProcedure.query(opts => opts.ctx.user),
     
