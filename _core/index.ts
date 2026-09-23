@@ -10,6 +10,7 @@ import employeeDocumentUploadRouter from "../employee-document-upload";
 import { connectToMongoDB } from "../mongodb";
 import { UPLOADS_DIR } from "../storage";
 import { startShiftSweep } from "../shiftSweep";
+import { backfillSubprojects } from "../fpbDb";
 import { initRealtime } from "./realtime";
 import { handleWingmanClock, handleWingmanEmployeeData, handleWingmanTeamSnapshot } from "../wingman";
 import { ENV } from "./env";
@@ -20,6 +21,20 @@ async function startServer() {
   // Sessions nobody clocked out of used to stay open indefinitely, so hours
   // and attendance drifted further from reality every day.
   startShiftSweep();
+
+  // Bring the board up to the sub-project level: give every existing project a
+  // default sub-project and file its cards under it. Idempotent, so once the
+  // data is consistent this returns immediately on subsequent boots. A failure
+  // here must not stop the server from serving.
+  backfillSubprojects()
+    .then(result => {
+      if (!result.skipped) {
+        console.log(
+          `[FPB] sub-project backfill: +${result.createdSubprojects} sub-projects, ${result.updatedTasks} tasks filed`
+        );
+      }
+    })
+    .catch(error => console.error("[FPB] sub-project backfill failed", error));
 
   const app = express();
   const server = createServer(app);

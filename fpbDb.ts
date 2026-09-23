@@ -16,6 +16,7 @@ import {
   FpbColumn,
   FpbProject,
   FpbProjectMember,
+  FpbSubproject,
   FpbSubtask,
   FpbSubtaskComment,
   FpbTask,
@@ -83,6 +84,10 @@ export const DEFAULT_COLUMNS = [
   { name: "In Review", color: "#8b5cf6", position: 3 },
   { name: "Done", color: "#10b981", position: 4 },
 ];
+
+// The sub-project every project starts with, and the one that existing projects'
+// cards were filed under when the sub-project level was introduced.
+export const DEFAULT_SUBPROJECT_NAME = "General";
 
 // ==================== Columns ====================
 
@@ -178,6 +183,151 @@ export async function reorderColumns(items: { id: string; position: number }[]) 
       updateOne: { filter: { _id: toObjectId(i.id) }, update: { position: i.position } },
     }))
   );
+}
+
+// ==================== Sub-projects ====================
+
+export async function getSubprojects(projectId: string) {
+  await requireDb();
+  const subprojects = await FpbSubproject.find({ projectId: toObjectId(projectId) })
+    .sort({ position: 1 })
+    .lean();
+  return normalizeAll(subprojects);
+}
+
+/** The project a sub-project belongs to, so the API can run the project's access check on it. */
+export async function getSubprojectProjectId(id: string) {
+  await requireDb();
+  const sp = await FpbSubproject.findById(toObjectId(id), { projectId: 1 }).lean();
+  return sp ? String(sp.projectId) : null;
+}
+
+export async function createSubproject(input: {
+  projectId: string;
+  name: string;
+  color?: string;
+  createdBy: string;
+}) {
+  await requireDb();
+  const projectId = toObjectId(input.projectId);
+  const position = await FpbSubproject.countDocuments({ projectId });
+  const created = await FpbSubproject.create({
+    projectId,
+    name: input.name,
+    color: input.color ?? "#6366f1",
+    position,
+    createdBy: toObjectId(input.createdBy),
+  });
+  return normalize(created)!;
+}
+
+export async function updateSubproject(
+  id: string,
+  updates: { name?: string; color?: string }
+) {
+  await requireDb();
+  const payload: Record<string, unknown> = {};
+  if (updates.name !== undefined) payload.name = updates.name;
+  if (updates.color !== undefined) payload.color = updates.color;
+  const saved = await FpbSubproject.findByIdAndUpdate(toObjectId(id), payload, {
+    returnDocument: "after",
+  }).lean();
+  return normalize(saved);
+}
+
+/**
+ * Removes a sub-project and every card filed under it. A project must keep at
+ * least one sub-project, so the last one cannot be deleted.
+ */
+export async function deleteSubproject(id: string) {
+  await requireDb();
+  const subprojectId = toObjectId(id);
+  const sp = await FpbSubproject.findById(subprojectId).lean();
+  if (!sp) return { deletedTasks: 0 };
+
+  const remaining = await FpbSubproject.countDocuments({
+    projectId: sp.projectId,
+    _id: { $ne: subprojectId },
+  });
+  if (remaining === 0) {
+    throw new Error("Cannot delete the last sub-project");
+  }
+
+  const tasks = await FpbTask.find({ subprojectId }, { _id: 1 }).lean();
+  const taskIds = tasks.map(t => t._id);
+  const subtasks = await FpbSubtask.find({ taskId: { $in: taskIds } }, { _id: 1 }).lean();
+  await Promise.all([
+    FpbSubtaskComment.deleteMany({ subtaskId: { $in: subtasks.map(s => s._id) } }),
+    FpbSubtask.deleteMany({ taskId: { $in: taskIds } }),
+    FpbTaskComment.deleteMany({ taskId: { $in: taskIds } }),
+    FpbTaskMember.deleteMany({ taskId: { $in: taskIds } }),
+  ]);
+  await FpbTask.deleteMany({ subprojectId });
+  await FpbSubproject.deleteOne({ _id: subprojectId });
+  return { deletedTasks: taskIds.length };
+}
+
+/**
+ * Returns the first (default) sub-project of a project, creating one if the
+ * project has none yet. Callers that must land a card somewhere use this so a
+ * project is never left without a sub-project to file work under.
+ */
+export async function ensureDefaultSubproject(projectId: string, createdBy: string) {
+  await requireDb();
+  const pid = toObjectId(projectId);
+  const existing = await FpbSubproject.findOne({ projectId: pid }).sort({ position: 1 }).lean();
+  if (existing) return String(existing._id);
+  const created = await FpbSubproject.create({
+    projectId: pid,
+    name: DEFAULT_SUBPROJECT_NAME,
+    color: "#6366f1",
+    position: 0,
+    createdBy: toObjectId(createdBy),
+  });
+  return String(created._id);
+}
+
+/**
+ * One-time (idempotent) backfill for the sub-project level. Ensures every
+ * project has at least one sub-project and that every existing card is filed
+ * under its project's default sub-project. Safe to run on every boot: once the
+ * data is consistent it finds nothing to do and returns quickly.
+ */
+export async function backfillSubprojects() {
+  await requireDb();
+
+  const orphanTasks = await FpbTask.countDocuments({ subprojectId: { $exists: false } });
+  const projects = await FpbProject.find({}, { _id: 1, createdBy: 1 }).lean();
+  const subprojectCount = await FpbSubproject.countDocuments({});
+
+  // Nothing to do: no orphan cards and at least as many sub-projects as
+  // projects (the common steady state after the first run).
+  if (orphanTasks === 0 && subprojectCount >= projects.length) {
+    return { createdSubprojects: 0, updatedTasks: 0, skipped: true };
+  }
+
+  let createdSubprojects = 0;
+  let updatedTasks = 0;
+  for (const p of projects) {
+    let first = await FpbSubproject.findOne({ projectId: p._id }).sort({ position: 1 }).lean();
+    if (!first) {
+      const created = await FpbSubproject.create({
+        projectId: p._id,
+        name: DEFAULT_SUBPROJECT_NAME,
+        color: "#6366f1",
+        position: 0,
+        createdBy: p.createdBy,
+      });
+      first = created.toObject() as any;
+      createdSubprojects += 1;
+    }
+    const res = await FpbTask.updateMany(
+      { projectId: p._id, subprojectId: { $exists: false } },
+      { $set: { subprojectId: first!._id } }
+    );
+    updatedTasks += res.modifiedCount ?? 0;
+  }
+  return { createdSubprojects, updatedTasks, skipped: false };
 }
 
 // ==================== Projects ====================
@@ -298,6 +448,16 @@ export async function createProject(input: {
     }))
   );
 
+  // Every project starts with one sub-project, so the board always has a
+  // sub-project to show and cards always have somewhere to live.
+  await FpbSubproject.create({
+    projectId: project._id,
+    name: DEFAULT_SUBPROJECT_NAME,
+    color: "#6366f1",
+    position: 0,
+    createdBy: toObjectId(input.createdBy),
+  });
+
   // The creator is always a member, plus anyone picked in the dialog.
   const memberIds = new Set<string>([input.createdBy, ...(input.memberIds ?? [])]);
   await setProjectMembers(String(project._id), [...memberIds]);
@@ -341,6 +501,7 @@ export async function deleteProject(id: string) {
   await Promise.all([
     FpbTask.deleteMany({ projectId }),
     FpbColumn.deleteMany({ projectId }),
+    FpbSubproject.deleteMany({ projectId }),
     FpbProjectMember.deleteMany({ projectId }),
     FpbAnnotation.deleteMany({ projectId }),
     FpbActivity.deleteMany({ projectId }),
@@ -378,7 +539,11 @@ export async function moveTask(id: string, columnId: string, position: number) {
     };
   };
 
-  const destination = (await FpbTask.find({ columnId: target }).sort({ position: 1 }).lean())
+  // Columns are shared across a project's sub-projects, so a column holds cards
+  // from several sub-projects. Renumber only within the moved card's own
+  // sub-project, or the boards would fight over each other's positions.
+  const scope = { subprojectId: task.subprojectId };
+  const destination = (await FpbTask.find({ ...scope, columnId: target }).sort({ position: 1 }).lean())
     .filter(t => String(t._id) !== id);
 
   const clamped = Math.max(0, Math.min(position, destination.length));
@@ -392,7 +557,7 @@ export async function moveTask(id: string, columnId: string, position: number) {
   }));
 
   if (!sameColumn) {
-    const source = (await FpbTask.find({ columnId: from }).sort({ position: 1 }).lean())
+    const source = (await FpbTask.find({ ...scope, columnId: from }).sort({ position: 1 }).lean())
       .filter(t => String(t._id) !== id);
     writes.push(
       ...source.map((t, index) => ({
@@ -451,9 +616,12 @@ async function syncCompletion(
 
 // ==================== Tasks ====================
 
-export async function getTasks(projectId: string) {
+export async function getTasks(projectId: string, subprojectId?: string) {
   await requireDb();
-  const tasks = await FpbTask.find({ projectId: toObjectId(projectId) })
+  const filter: Record<string, unknown> = { projectId: toObjectId(projectId) };
+  // The board asks for one sub-project's cards; other callers still get them all.
+  if (subprojectId) filter.subprojectId = toObjectId(subprojectId);
+  const tasks = await FpbTask.find(filter)
     .sort({ columnId: 1, position: 1 })
     .lean();
   if (tasks.length === 0) return [];
@@ -509,6 +677,7 @@ export async function getTask(id: string) {
 
 export async function createTask(input: {
   projectId: string;
+  subprojectId?: string;
   columnId?: string;
   title: string;
   description?: string;
@@ -520,6 +689,10 @@ export async function createTask(input: {
 }) {
   await requireDb();
   const projectId = toObjectId(input.projectId);
+  // File the card under the named sub-project, or the project's default one.
+  const subprojectId = toObjectId(
+    input.subprojectId ?? (await ensureDefaultSubproject(input.projectId, input.createdBy))
+  );
 
   // Default to the first column, so a card always lands somewhere on the board.
   let columnId = input.columnId;
@@ -529,10 +702,16 @@ export async function createTask(input: {
     columnId = String(first._id);
   }
 
-  const position = await FpbTask.countDocuments({ projectId, columnId: toObjectId(columnId) });
+  // Position runs per (sub-project, column): each sub-project has its own stack
+  // of cards in a shared column.
+  const position = await FpbTask.countDocuments({
+    subprojectId,
+    columnId: toObjectId(columnId),
+  });
 
   const task = await FpbTask.create({
     projectId,
+    subprojectId,
     columnId: toObjectId(columnId),
     title: input.title,
     description: input.description,

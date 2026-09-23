@@ -9,6 +9,7 @@ import {
   FpbColumn,
   FpbProject,
   FpbProjectMember,
+  FpbSubproject,
   FpbSubtask,
   FpbTask,
   FpbTaskComment,
@@ -61,8 +62,8 @@ describeWithDb("Flow Project Board", () => {
     const ids = [adminId, memberId, outsiderId];
     await Promise.all([
       FpbSubtask.deleteMany({}), FpbTaskComment.deleteMany({}), FpbTaskMember.deleteMany({}),
-      FpbTask.deleteMany({}), FpbColumn.deleteMany({}), FpbProjectMember.deleteMany({}),
-      FpbActivity.deleteMany({}), FpbAnnotation.deleteMany({}),
+      FpbTask.deleteMany({}), FpbColumn.deleteMany({}), FpbSubproject.deleteMany({}),
+      FpbProjectMember.deleteMany({}), FpbActivity.deleteMany({}), FpbAnnotation.deleteMany({}),
     ]);
     await Promise.all([
       FpbProject.deleteMany({}),
@@ -76,7 +77,8 @@ describeWithDb("Flow Project Board", () => {
   beforeEach(async () => {
     await Promise.all([
       FpbProject.deleteMany({}), FpbColumn.deleteMany({}), FpbTask.deleteMany({}),
-      FpbProjectMember.deleteMany({}), FpbTaskMember.deleteMany({}), FpbSubtask.deleteMany({}),
+      FpbSubproject.deleteMany({}), FpbProjectMember.deleteMany({}),
+      FpbTaskMember.deleteMany({}), FpbSubtask.deleteMany({}),
     ]);
   });
 
@@ -448,6 +450,85 @@ describeWithDb("Flow Project Board", () => {
       projectId: project.id, title: "mine", assignedTo: adminId,
     });
     expect(await Notification.countDocuments({ userId: adminId, type: "task_assigned" })).toBe(0);
+  });
+
+  // ------------------------------------------------------------ sub-projects
+
+  it("gives each new project one default sub-project", async () => {
+    const { project } = await newProject("Branded");
+    const board = await asAdmin().fpb.getBoard({ projectId: project.id });
+    expect(board.subprojects.length).toBe(1);
+    expect(board.activeSubprojectId).toBe(board.subprojects[0].id);
+  });
+
+  it("runs the board per sub-project", async () => {
+    const { project } = await newProject("Kunzul Channar");
+    const general = (await asAdmin().fpb.getBoard({ projectId: project.id })).activeSubprojectId as string;
+    const dev = await asAdmin().fpb.createSubproject({ projectId: project.id, name: "Development" });
+
+    await asAdmin().fpb.createTask({ projectId: project.id, subprojectId: general, title: "in general" });
+    await asAdmin().fpb.createTask({ projectId: project.id, subprojectId: dev.id, title: "ui ux" });
+
+    // A sub-project's board shows only its own cards.
+    const devBoard = await asAdmin().fpb.getBoard({ projectId: project.id, subprojectId: dev.id });
+    expect(devBoard.tasks.map((t: any) => t.title)).toEqual(["ui ux"]);
+
+    const generalBoard = await asAdmin().fpb.getBoard({ projectId: project.id, subprojectId: general });
+    expect(generalBoard.tasks.map((t: any) => t.title)).toEqual(["in general"]);
+  });
+
+  it("numbers cards independently within each sub-project", async () => {
+    const { project, columns } = await newProject("Independent");
+    const general = (await asAdmin().fpb.getBoard({ projectId: project.id })).activeSubprojectId as string;
+    const dev = await asAdmin().fpb.createSubproject({ projectId: project.id, name: "Dev" });
+
+    const g1 = await asAdmin().fpb.createTask({
+      projectId: project.id, subprojectId: general, title: "g1", columnId: columns[0].id,
+    });
+    const d1 = await asAdmin().fpb.createTask({
+      projectId: project.id, subprojectId: dev.id, title: "d1", columnId: columns[0].id,
+    });
+
+    // Each is the first card in its own sub-project's copy of the shared column.
+    expect(g1.position).toBe(0);
+    expect(d1.position).toBe(0);
+  });
+
+  it("deletes a sub-project along with its cards, but never the last", async () => {
+    const { project } = await newProject("Prune");
+    const general = (await asAdmin().fpb.getBoard({ projectId: project.id })).activeSubprojectId as string;
+    const dev = await asAdmin().fpb.createSubproject({ projectId: project.id, name: "Dev" });
+    const task = await asAdmin().fpb.createTask({
+      projectId: project.id, subprojectId: dev.id, title: "doomed",
+    });
+
+    const result = await asAdmin().fpb.deleteSubproject({ id: dev.id });
+    expect(result.deletedTasks).toBe(1);
+    expect(await FpbTask.findById(task.id).lean()).toBeNull();
+
+    // A project must keep at least one sub-project.
+    await expect(
+      asAdmin().fpb.deleteSubproject({ id: general })
+    ).rejects.toThrow(/last sub-project/);
+  });
+
+  it("refuses a task whose sub-project belongs to another project", async () => {
+    const a = await newProject("A");
+    const b = await newProject("B");
+    const bSub = (await asAdmin().fpb.getBoard({ projectId: b.project.id })).activeSubprojectId as string;
+
+    await expect(
+      asAdmin().fpb.createTask({ projectId: a.project.id, subprojectId: bSub, title: "wrong home" })
+    ).rejects.toThrow(/does not belong to this project/);
+  });
+
+  it("removes a project's sub-projects along with the project", async () => {
+    const { project } = await newProject("Gone");
+    await asAdmin().fpb.createSubproject({ projectId: project.id, name: "Extra" });
+
+    await asAdmin().fpb.deleteProject({ id: project.id });
+
+    expect(await FpbSubproject.countDocuments({ projectId: project.id })).toBe(0);
   });
 
   // ------------------------------------------------------------------ misc

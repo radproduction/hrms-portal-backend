@@ -78,6 +78,17 @@ async function requireColumnAccess(
   return projectId;
 }
 
+/** Sub-projects are gated by the project they belong to. */
+async function requireSubprojectAccess(
+  ctx: { user: { id: string; role?: string } },
+  subprojectId: string
+) {
+  const projectId = await fpb.getSubprojectProjectId(subprojectId);
+  if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "Sub-project not found" });
+  await requireProjectAccess(ctx, projectId);
+  return projectId;
+}
+
 /**
  * Board changes are only useful if the people affected hear about them, so
  * assignment and membership raise a notification and a realtime ping. Never
@@ -117,16 +128,91 @@ async function projectIdForTask(taskId: string) {
 export const fpbRouter = router({
   // ==================== Board & columns ====================
 
-  /** One project's board: its columns and the task cards sitting in them. */
+  /**
+   * One project's board. A project is split into sub-projects (e.g. a Brand
+   * split into Social Media / Development / SEO); the board runs one at a time.
+   * Columns are shared across the project; the cards are those of the selected
+   * sub-project. Omitting `subprojectId` shows the first sub-project.
+   */
   getBoard: protectedProcedure
-    .input(z.object({ projectId: objectId }))
+    .input(z.object({ projectId: objectId, subprojectId: objectId.optional() }))
     .query(async ({ ctx, input }) => {
       const project = await requireProjectAccess(ctx, input.projectId);
-      const [columns, tasks] = await Promise.all([
+      const [subprojects, columns] = await Promise.all([
+        fpb.getSubprojects(input.projectId),
         fpb.getColumns(input.projectId),
-        fpb.getTasks(input.projectId),
       ]);
-      return { project, columns, tasks };
+      // Resolve the sub-project to display: the requested one if it belongs to
+      // this project, otherwise the first. Every project has at least one.
+      const active =
+        subprojects.find(s => s.id === input.subprojectId) ?? subprojects[0];
+      const tasks = active
+        ? await fpb.getTasks(input.projectId, active.id as string)
+        : [];
+      return {
+        project,
+        subprojects,
+        activeSubprojectId: active ? (active.id as string) : null,
+        columns,
+        tasks,
+      };
+    }),
+
+  // ==================== Sub-projects ====================
+
+  getSubprojects: protectedProcedure
+    .input(z.object({ projectId: objectId }))
+    .query(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      return fpb.getSubprojects(input.projectId);
+    }),
+
+  createSubproject: protectedProcedure
+    .input(
+      z.object({
+        projectId: objectId,
+        name: z.string().min(1).max(120),
+        color: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      const created = await fpb.createSubproject({ ...input, createdBy: ctx.user.id });
+      await fpb.logActivity(input.projectId, ctx.user.id, "added sub-project", input.name);
+      return created;
+    }),
+
+  updateSubproject: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        name: z.string().min(1).max(120).optional(),
+        color: z.string().optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await requireSubprojectAccess(ctx, input.id);
+      const { id, ...updates } = input;
+      const saved = await fpb.updateSubproject(id, updates);
+      if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Sub-project not found" });
+      await fpb.logActivity(projectId, ctx.user.id, "updated sub-project");
+      return saved;
+    }),
+
+  deleteSubproject: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await requireSubprojectAccess(ctx, input.id);
+      try {
+        const result = await fpb.deleteSubproject(input.id);
+        await fpb.logActivity(projectId, ctx.user.id, "deleted sub-project");
+        return result;
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: error instanceof Error ? error.message : "Could not delete sub-project",
+        });
+      }
     }),
 
   createColumn: protectedProcedure
@@ -337,10 +423,10 @@ export const fpbRouter = router({
   // ==================== Tasks ====================
 
   getTasks: protectedProcedure
-    .input(z.object({ projectId: objectId }))
+    .input(z.object({ projectId: objectId, subprojectId: objectId.optional() }))
     .query(async ({ ctx, input }) => {
       await requireProjectAccess(ctx, input.projectId);
-      return fpb.getTasks(input.projectId);
+      return fpb.getTasks(input.projectId, input.subprojectId);
     }),
 
   getTask: protectedProcedure
@@ -356,6 +442,9 @@ export const fpbRouter = router({
     .input(
       z.object({
         projectId: objectId,
+        // Which sub-project (e.g. "Development") the card belongs to. Omitted
+        // means the project's first sub-project.
+        subprojectId: objectId.optional(),
         // Omitted means the first column, so a card always lands on the board.
         columnId: objectId.optional(),
         title: z.string().min(1).max(500),
@@ -368,6 +457,17 @@ export const fpbRouter = router({
     )
     .mutation(async ({ ctx, input }) => {
       const project = await requireProjectAccess(ctx, input.projectId);
+      // When a sub-project is named it must belong to this project; when it is
+      // omitted the data layer files the card under the project's default one.
+      if (input.subprojectId) {
+        const spProjectId = await fpb.getSubprojectProjectId(input.subprojectId);
+        if (spProjectId !== input.projectId) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Sub-project does not belong to this project",
+          });
+        }
+      }
       const task = await fpb.createTask({ ...input, createdBy: ctx.user.id });
       await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title);
 

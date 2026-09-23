@@ -45,6 +45,37 @@ fpbColumnSchema.index({ projectId: 1, position: 1 });
 
 export const FpbColumn = model<IFpbColumn>("FpbColumn", fpbColumnSchema);
 
+// ==================== Sub-project ====================
+// A project (a Brand, say "Kunzul Channar") is divided into sub-projects
+// (Social Media, Development, SEO, Marketing). The board runs one sub-project at
+// a time: the columns are shared across the project, but the cards on them are
+// filtered to the sub-project the viewer has selected. Every project has at
+// least one sub-project, so cards always have somewhere to live.
+export interface IFpbSubproject extends Document {
+  _id: Types.ObjectId;
+  projectId: Types.ObjectId;
+  name: string;
+  color: string;
+  position: number;
+  createdBy: Types.ObjectId;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const fpbSubprojectSchema = new Schema<IFpbSubproject>(
+  {
+    projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
+    name: { type: String, required: true },
+    color: { type: String, default: "#6366f1" },
+    position: { type: Number, default: 0, required: true },
+    createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+  },
+  { timestamps: true }
+);
+fpbSubprojectSchema.index({ projectId: 1, position: 1 });
+
+export const FpbSubproject = model<IFpbSubproject>("FpbSubproject", fpbSubprojectSchema);
+
 // ==================== Project (a workspace, not a card) ====================
 export interface IFpbProject extends Document {
   _id: Types.ObjectId;
@@ -112,6 +143,8 @@ export const FpbProjectMember = model<IFpbProjectMember>(
 export interface IFpbTask extends Document {
   _id: Types.ObjectId;
   projectId: Types.ObjectId;
+  /** Which sub-project (e.g. "Development") of the project this card belongs to. */
+  subprojectId: Types.ObjectId;
   /** Which column of its project's board the card currently sits in. */
   columnId: Types.ObjectId;
   title: string;
@@ -131,6 +164,7 @@ export interface IFpbTask extends Document {
 const fpbTaskSchema = new Schema<IFpbTask>(
   {
     projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
+    subprojectId: { type: Schema.Types.ObjectId, ref: "FpbSubproject", required: true },
     columnId: { type: Schema.Types.ObjectId, ref: "FpbColumn", required: true },
     title: { type: String, required: true },
     description: String,
@@ -146,6 +180,8 @@ const fpbTaskSchema = new Schema<IFpbTask>(
   { timestamps: true }
 );
 fpbTaskSchema.index({ projectId: 1, columnId: 1, position: 1 });
+// The board sorts one sub-project's cards within each column.
+fpbTaskSchema.index({ subprojectId: 1, columnId: 1, position: 1 });
 
 export const FpbTask = model<IFpbTask>("FpbTask", fpbTaskSchema);
 
