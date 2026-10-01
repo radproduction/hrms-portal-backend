@@ -136,4 +136,31 @@ describeWithDb("team.getOverview", () => {
     const names = res.members.map(m => m.name);
     expect(names).toEqual(expect.arrayContaining(["Member A", "Member B"]));
   });
+
+  it("includes a head who was never filed under the department they lead", async () => {
+    // Production shape: setDepartmentHead records the head on the department but
+    // does not set the head's own departmentId. Such a head used to vanish from
+    // the overview, so their clock-in never showed for the finance/admin viewer.
+    const lone = await User.create({
+      openId: `to-lone-${stamp}`, name: "Lone Head", role: "user", employeeId: `TOLONE${stamp}`,
+    });
+    const loneId = String(lone._id);
+    const deptC = await Department.create({ name: `TO C ${stamp}` });
+    await setDepartmentHead(String(deptC._id), loneId); // no setUserDepartment on purpose
+    const since = new Date(Date.now() - 2 * H);
+    await TimeEntry.create({ userId: loneId, timeIn: since, status: "active" });
+
+    try {
+      const res = await caller(adminId, "admin").team.getOverview();
+      const head = res.members.find(m => m.id === loneId);
+      expect(head).toBeDefined();
+      expect(head!.isHead).toBe(true);
+      expect(head!.departmentName).toBe(`TO C ${stamp}`);
+      expect(head!.clockedInSince).not.toBeNull();
+    } finally {
+      await TimeEntry.deleteMany({ userId: loneId });
+      await Department.deleteMany({ _id: deptC._id });
+      await User.deleteMany({ _id: lone._id });
+    }
+  });
 });

@@ -267,8 +267,21 @@ export async function getTeamOverviewData(
   const headByDept = new Map(
     departments.filter(d => d.headUserId).map(d => [String(d._id), String(d.headUserId)])
   );
+  // The department each head leads. setDepartmentHead records the head on the
+  // department but does not move them into it, so a head often has no
+  // departmentId of their own - and would then be missing from their own team's
+  // overview even though their clock-in is exactly what the view is for.
+  const ledDeptByHead: typeof deptById = new Map();
+  for (const d of departments) {
+    if (d.headUserId) ledDeptByHead.set(String(d.headUserId), d);
+  }
+  const headIds = departments.map(d => d.headUserId).filter(Boolean);
 
-  const users = await User.find({ departmentId: { $in: validIds } }).sort({ name: 1 }).lean();
+  // Members of the departments, plus their heads (who may not be filed under the
+  // department they lead).
+  const users = await User.find({
+    $or: [{ departmentId: { $in: validIds } }, { _id: { $in: headIds } }],
+  }).sort({ name: 1 }).lean();
   if (users.length === 0) {
     return {
       departments: departments.map(d => ({ id: String(d._id), name: d.name })),
@@ -312,8 +325,15 @@ export async function getTeamOverviewData(
 
   const members: TeamMemberOverview[] = users.map(u => {
     const id = String(u._id);
-    const deptId = u.departmentId ? String(u.departmentId) : null;
-    const dept = deptId ? deptById.get(deptId) : null;
+    let deptId = u.departmentId ? String(u.departmentId) : null;
+    let dept = deptId ? deptById.get(deptId) : null;
+    let isHead = deptId ? headByDept.get(deptId) === id : false;
+    // A head who is not filed under the department they lead: show them under it.
+    if (!dept && ledDeptByHead.has(id)) {
+      dept = ledDeptByHead.get(id)!;
+      deptId = String(dept._id);
+      isHead = true;
+    }
     const since = activeSince.get(id);
     return {
       id,
@@ -324,7 +344,7 @@ export async function getTeamOverviewData(
       role: u.role ?? "user",
       departmentId: deptId,
       departmentName: dept?.name ?? null,
-      isHead: deptId ? headByDept.get(deptId) === id : false,
+      isHead,
       clockedInSince: since ? new Date(since).toISOString() : null,
       entries: (entriesByUser.get(id) ?? []).map((e: any) => ({
         userId: id,
