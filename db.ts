@@ -1678,7 +1678,10 @@ export async function getOngoingTasksWithAssignments() {
 
 export async function getEmployeeStatusSnapshot() {
   await requireDb();
-  const users = await User.find({ role: "user" }).lean();
+  // Everyone who clocks in, not just plain employees: department heads and the
+  // head of operations are staff too, so the live attendance board (and its
+  // counts) must include them. Only the top-level admins are left out.
+  const users = await User.find({ role: { $ne: "admin" } }).lean();
   const userIds = users.map((u: any) => u._id);
   const now = new Date();
   const officeLat = Number.isFinite(ENV.officeLat) ? ENV.officeLat : null;
