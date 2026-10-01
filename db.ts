@@ -1823,7 +1823,11 @@ export async function getAttendanceReportData(
 ) {
   await requireDb();
 
-  const userFilter: Record<string, unknown> = { role: "user" };
+  // Department heads and the head of operations clock in like everyone else, so
+  // the monthly report (and the employee list it populates) must include them;
+  // only top-level admins are left out. Previously this was role "user", which
+  // left heads out of every month's report and unselectable in the picker.
+  const userFilter: Record<string, unknown> = { role: { $ne: "admin" } };
   if (employeeId) userFilter._id = toObjectId(employeeId);
 
   const users = await User.find(userFilter).sort({ name: 1 }).lean();
