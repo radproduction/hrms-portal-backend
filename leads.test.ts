@@ -6,7 +6,7 @@ import mongoose from "mongoose";
 import { appRouter } from "./routers";
 import type { TrpcContext } from "./_core/context";
 import { Notification, User } from "./models";
-import { createLimiter, Lead, leadInput, leadsHttpRouter } from "./leads";
+import { buildLeadEmail, createLimiter, Lead, leadInput, leadsHttpRouter, parseRecipients, parseSender, sendLeadEmail } from "./leads";
 import { describeWithDb } from "./test-utils";
 
 describe("leadInput", () => {
@@ -38,6 +38,80 @@ describe("createLimiter", () => {
     // The first hit has aged out, so one more is allowed.
     expect(allow("a", 1050)).toBe(true);
     expect(allow("a", 1060)).toBe(false);
+  });
+});
+
+describe("sign-up email", () => {
+  const lead = { name: "Sara Khan", company: "Acme", email: "sara@acme.com", teamSize: "21 to 50", plan: "Enterprise" };
+  const env = { RESEND_API_KEY: "re_test", LEADS_FROM_EMAIL: "Now <leads@example.com>", LEADS_NOTIFY_EMAILS: " a@example.com, b@example.org " };
+
+  it("reads the recipient list and drops anything that is not an address", () => {
+    expect(parseRecipients(" a@example.com, b@example.org ")).toEqual(["a@example.com", "b@example.org"]);
+    expect(parseRecipients("a@example.com,,not-an-address, <c@example.com>")).toEqual(["a@example.com"]);
+    expect(parseRecipients(undefined)).toEqual([]);
+  });
+
+  it("escapes what the visitor typed and keeps the subject on one line", () => {
+    const mail = buildLeadEmail({ ...lead, name: "Sara\r\nBcc: x@evil.example", company: '<img src=x onerror="alert(1)">' });
+    expect(mail.subject).not.toMatch(/[\r\n]/);
+    expect(mail.html).not.toContain("<img");
+    expect(mail.html).toContain("&lt;img src=x onerror=&quot;alert(1)&quot;&gt;");
+    expect(mail.text).toContain("Plan: Enterprise");
+  });
+
+  it("sends one message to every recipient, replying to the lead", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fake = (async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response("{}", { status: 200 });
+    }) as unknown as typeof fetch;
+    expect(await sendLeadEmail(lead, env, fake)).toBe("sent");
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toBe("https://api.resend.com/emails");
+    expect((calls[0].init.headers as Record<string, string>).Authorization).toBe("Bearer re_test");
+    const body = JSON.parse(String(calls[0].init.body));
+    expect(body).toMatchObject({ from: "Now <leads@example.com>", to: ["a@example.com", "b@example.org"], reply_to: "sara@acme.com", subject: "New sign-up: Sara Khan at Acme" });
+  });
+
+  it("uses Brevo when its key is set, in the shape Brevo expects", async () => {
+    const calls: { url: string; init: RequestInit }[] = [];
+    const fake = (async (url: string, init: RequestInit) => {
+      calls.push({ url, init });
+      return new Response("{}", { status: 201 });
+    }) as unknown as typeof fetch;
+    // Both keys present: Brevo wins.
+    expect(await sendLeadEmail(lead, { ...env, BREVO_API_KEY: "xkeysib-test" }, fake)).toBe("sent");
+    expect(calls[0].url).toBe("https://api.brevo.com/v3/smtp/email");
+    expect((calls[0].init.headers as Record<string, string>)["api-key"]).toBe("xkeysib-test");
+    expect(JSON.parse(String(calls[0].init.body))).toMatchObject({
+      sender: { name: "Now", email: "leads@example.com" },
+      to: [{ email: "a@example.com" }, { email: "b@example.org" }],
+      replyTo: { email: "sara@acme.com" },
+      subject: "New sign-up: Sara Khan at Acme",
+    });
+    expect(JSON.parse(String(calls[0].init.body)).htmlContent).toContain("Sara Khan");
+  });
+
+  it("reads a sender with or without a name, and refuses nonsense", () => {
+    expect(parseSender("Now <leads@example.com>")).toEqual({ name: "Now", email: "leads@example.com" });
+    expect(parseSender('"Now HRMS" <leads@example.com>')).toEqual({ name: "Now HRMS", email: "leads@example.com" });
+    expect(parseSender(" leads@example.com ")).toEqual({ email: "leads@example.com" });
+    expect(parseSender("Now")).toBeNull();
+    expect(parseSender(undefined)).toBeNull();
+  });
+
+  it("does nothing until it is configured, and never throws when sending fails", async () => {
+    let called = 0;
+    const counting = (async () => { called += 1; return new Response("{}", { status: 200 }); }) as unknown as typeof fetch;
+    expect(await sendLeadEmail(lead, { ...env, RESEND_API_KEY: "" }, counting)).toBe("not_configured");
+    expect(await sendLeadEmail(lead, { ...env, LEADS_NOTIFY_EMAILS: "nobody" }, counting)).toBe("not_configured");
+    expect(await sendLeadEmail(lead, { ...env, LEADS_FROM_EMAIL: undefined }, counting)).toBe("not_configured");
+    expect(called).toBe(0);
+
+    const refused = (async () => new Response("nope", { status: 403 })) as unknown as typeof fetch;
+    const broken = (async () => { throw new Error("network down"); }) as unknown as typeof fetch;
+    expect(await sendLeadEmail(lead, env, refused)).toBe("failed");
+    expect(await sendLeadEmail(lead, env, broken)).toBe("failed");
   });
 });
 

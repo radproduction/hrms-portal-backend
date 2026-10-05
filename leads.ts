@@ -115,6 +115,117 @@ async function notifyTeam(lead: { name: string; company: string; plan: string })
   }
 }
 
+type LeadMail = { name: string; company: string; email: string; teamSize: string; plan: string };
+
+const escapeHtml = (value: string) =>
+  value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+/** The comma-separated addresses in LEADS_NOTIFY_EMAILS, minus anything that is not an address. */
+export function parseRecipients(raw: string | undefined): string[] {
+  return (raw ?? "")
+    .split(",")
+    .map(part => part.trim())
+    .filter(part => /^[^\s@<>,]+@[^\s@<>,]+\.[^\s@<>,]+$/.test(part))
+    .slice(0, 20);
+}
+
+/**
+ * The email sent for one sign-up. Everything the visitor typed is escaped in
+ * the HTML part and stripped of line breaks in the subject, so a sign-up can
+ * never inject markup or extra headers into the message.
+ */
+export function buildLeadEmail(lead: LeadMail) {
+  const oneLine = (value: string) => value.replace(/[\r\n]+/g, " ").trim();
+  const rows: [string, string][] = [
+    ["Name", lead.name],
+    ["Company", lead.company],
+    ["Email", lead.email],
+    ["Team size", lead.teamSize || "Not given"],
+    ["Plan", lead.plan || "Not given"],
+  ];
+  return {
+    subject: `New sign-up: ${oneLine(lead.name)} at ${oneLine(lead.company)}`.slice(0, 200),
+    text: `${rows.map(([label, value]) => `${label}: ${value}`).join("\n")}\n\nSee all leads in the portal under Admin > Leads.`,
+    html:
+      `<table cellpadding="6" style="font-family:sans-serif;font-size:14px">` +
+      rows.map(([label, value]) => `<tr><td style="color:#5b6258">${label}</td><td><strong>${escapeHtml(value)}</strong></td></tr>`).join("") +
+      `</table><p style="font-family:sans-serif;font-size:13px;color:#5b6258">See all leads in the portal under Admin &gt; Leads.</p>`,
+  };
+}
+
+/** "Now <leads@example.com>" or a bare address, as the name and email a mail API wants. */
+export function parseSender(raw: string | undefined): { name?: string; email: string } | null {
+  const value = (raw ?? "").trim();
+  const named = /^(.*)<([^<>\s]+@[^<>\s]+)>$/.exec(value);
+  if (named) {
+    const name = named[1].trim().replace(/^"|"$/g, "");
+    return name ? { name, email: named[2] } : { email: named[2] };
+  }
+  return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(value) ? { email: value } : null;
+}
+
+/**
+ * Emails a sign-up to the addresses in LEADS_NOTIFY_EMAILS.
+ *
+ * Goes over HTTPS to a mail service rather than SMTP, because DigitalOcean
+ * blocks the SMTP ports on droplets. Brevo is used when BREVO_API_KEY is set,
+ * otherwise Resend when RESEND_API_KEY is. Does nothing until a key,
+ * LEADS_FROM_EMAIL and LEADS_NOTIFY_EMAILS are all set. The lead is already
+ * saved by the time this runs, so a failure here loses an email, never a lead.
+ */
+export async function sendLeadEmail(
+  lead: LeadMail,
+  env: Record<string, string | undefined> = process.env,
+  send: typeof fetch = fetch
+): Promise<"sent" | "not_configured" | "failed"> {
+  const sender = parseSender(env.LEADS_FROM_EMAIL);
+  const to = parseRecipients(env.LEADS_NOTIFY_EMAILS);
+  if (!sender || to.length === 0 || (!env.BREVO_API_KEY && !env.RESEND_API_KEY)) return "not_configured";
+  const mail = buildLeadEmail(lead);
+
+  const request = env.BREVO_API_KEY
+    ? {
+        url: "https://api.brevo.com/v3/smtp/email",
+        headers: { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
+        body: {
+          sender,
+          to: to.map(email => ({ email })),
+          replyTo: { email: lead.email },
+          subject: mail.subject,
+          htmlContent: mail.html,
+          textContent: mail.text,
+        },
+      }
+    : {
+        url: "https://api.resend.com/emails",
+        headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
+        body: {
+          from: sender.name ? `${sender.name} <${sender.email}>` : sender.email,
+          to,
+          reply_to: lead.email,
+          ...mail,
+        },
+      };
+
+  try {
+    const response = await send(request.url, {
+      method: "POST",
+      headers: request.headers as Record<string, string>,
+      body: JSON.stringify(request.body),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!response.ok) {
+      // Status only: the response body can echo the lead back.
+      console.error("[Leads] email was not accepted, status", response.status);
+      return "failed";
+    }
+    return "sent";
+  } catch (error) {
+    console.error("[Leads] email could not be sent", error instanceof Error ? error.name : "unknown error");
+    return "failed";
+  }
+}
+
 export const leadsHttpRouter = Router();
 
 // A sign-up is a few short fields; anything bigger is not one.
@@ -140,6 +251,7 @@ leadsHttpRouter.post("/api/leads", express.json({ limit: "10kb" }), async (req, 
     if (!recent) {
       await Lead.create(lead);
       void notifyTeam(lead);
+      void sendLeadEmail(lead);
     }
     return res.status(200).json({ ok: true });
   } catch (error) {
