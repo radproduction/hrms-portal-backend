@@ -22,6 +22,7 @@ import { storageDelete } from "./storage";
 import { isAnyHead, isOrgWide, isSuperAdmin, canAssignRole, assignableRoles, ROLE_LABELS } from "./roles";
 import * as departments from "./departments";
 import { routeLeaveFor } from "./leaveRouting";
+import { requestsRouter, timeRouter, wingmanRouter } from "./nowRouter";
 
 /**
  * Tells each assignee of a legacy project task that it was assigned to them -
@@ -78,6 +79,13 @@ export const appRouter = router({
   // Flow Project Board (Kanban). Separate from the legacy `projects` router
   // below, which still backs the dashboard, reports and the clock-out flow.
   fpb: fpbRouter,
+
+  // Now workspace screens: attendance corrections and support tickets, the
+  // employee's own time summary and leave balance, and Wingman in the portal.
+  // All new; see nowRouter.ts.
+  requests: requestsRouter,
+  time: timeRouter,
+  wingman: wingmanRouter,
 
   // A department head's window onto their own team. Everything else a head can
   // reach is org-wide and refuses them; this is scoped to the departments they
