@@ -14,6 +14,7 @@ import { backfillSubprojects } from "../fpbDb";
 import { initRealtime } from "./realtime";
 import { handleWingmanClock, handleWingmanEmployeeData, handleWingmanTeamSnapshot } from "../wingman";
 import { ENV } from "./env";
+import { leadsHttpRouter } from "../leads";
 
 async function startServer() {
   await connectToMongoDB();
@@ -72,6 +73,10 @@ async function startServer() {
     res.vary("Cookie");
     next();
   });
+
+  // Sign-ups from the public landing page. Public on purpose, and mounted
+  // ahead of the 50mb body parser so it can apply its own small limit.
+  app.use(leadsHttpRouter);
 
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));

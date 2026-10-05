@@ -23,6 +23,7 @@ import { isAnyHead, isOrgWide, isSuperAdmin, canAssignRole, assignableRoles, ROL
 import * as departments from "./departments";
 import { routeLeaveFor } from "./leaveRouting";
 import { requestsRouter, timeRouter, wingmanRouter } from "./nowRouter";
+import { leadsRouter } from "./leads";
 
 /**
  * Tells each assignee of a legacy project task that it was assigned to them -
@@ -86,6 +87,10 @@ export const appRouter = router({
   requests: requestsRouter,
   time: timeRouter,
   wingman: wingmanRouter,
+
+  // Sign-ups from the public landing page, for admins to read. The page
+  // itself posts to POST /api/leads; see leads.ts.
+  leads: leadsRouter,
 
   // A department head's window onto their own team. Everything else a head can
   // reach is org-wide and refuses them; this is scoped to the departments they
