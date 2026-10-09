@@ -17,6 +17,7 @@ import { emitNotification } from "./_core/realtime";
 import { connectToMongoDB } from "./mongodb";
 import { User } from "./models";
 import { isOrgWide } from "./roles";
+import { buildWelcomeEmail } from "./welcomeEmail";
 
 export interface ILead extends Document {
   _id: Types.ObjectId;
@@ -164,33 +165,34 @@ export function parseSender(raw: string | undefined): { name?: string; email: st
   return /^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(value) ? { email: value } : null;
 }
 
-/**
- * Emails a sign-up to the addresses in LEADS_NOTIFY_EMAILS.
- *
- * Goes over HTTPS to a mail service rather than SMTP, because DigitalOcean
- * blocks the SMTP ports on droplets. Brevo is used when BREVO_API_KEY is set,
- * otherwise Resend when RESEND_API_KEY is. Does nothing until a key,
- * LEADS_FROM_EMAIL and LEADS_NOTIFY_EMAILS are all set. The lead is already
- * saved by the time this runs, so a failure here loses an email, never a lead.
- */
-export async function sendLeadEmail(
-  lead: LeadMail,
-  env: Record<string, string | undefined> = process.env,
-  send: typeof fetch = fetch
-): Promise<"sent" | "not_configured" | "failed"> {
-  const sender = parseSender(env.LEADS_FROM_EMAIL);
-  const to = parseRecipients(env.LEADS_NOTIFY_EMAILS);
-  if (!sender || to.length === 0 || (!env.BREVO_API_KEY && !env.RESEND_API_KEY)) return "not_configured";
-  const mail = buildLeadEmail(lead);
+type OutgoingMail = {
+  to: string[];
+  replyTo?: string;
+  subject: string;
+  html: string;
+  text: string;
+};
 
+/**
+ * Hands one message to the mail service, over HTTPS rather than SMTP because
+ * DigitalOcean blocks the SMTP ports on droplets. Brevo is used when
+ * BREVO_API_KEY is set, otherwise Resend when RESEND_API_KEY is.
+ */
+async function deliverMail(
+  mail: OutgoingMail,
+  sender: { name?: string; email: string },
+  env: Record<string, string | undefined>,
+  send: typeof fetch,
+  label: string
+): Promise<"sent" | "failed"> {
   const request = env.BREVO_API_KEY
     ? {
         url: "https://api.brevo.com/v3/smtp/email",
         headers: { "api-key": env.BREVO_API_KEY, "Content-Type": "application/json", Accept: "application/json" },
         body: {
           sender,
-          to: to.map(email => ({ email })),
-          replyTo: { email: lead.email },
+          to: mail.to.map(email => ({ email })),
+          ...(mail.replyTo ? { replyTo: { email: mail.replyTo } } : {}),
           subject: mail.subject,
           htmlContent: mail.html,
           textContent: mail.text,
@@ -201,29 +203,75 @@ export async function sendLeadEmail(
         headers: { Authorization: `Bearer ${env.RESEND_API_KEY}`, "Content-Type": "application/json" },
         body: {
           from: sender.name ? `${sender.name} <${sender.email}>` : sender.email,
-          to,
-          reply_to: lead.email,
-          ...mail,
+          to: mail.to,
+          ...(mail.replyTo ? { reply_to: mail.replyTo } : {}),
+          subject: mail.subject,
+          html: mail.html,
+          text: mail.text,
         },
       };
 
   try {
     const response = await send(request.url, {
       method: "POST",
-      headers: request.headers as Record<string, string>,
+      headers: request.headers as unknown as Record<string, string>,
       body: JSON.stringify(request.body),
       signal: AbortSignal.timeout(10000),
     });
     if (!response.ok) {
       // Status only: the response body can echo the lead back.
-      console.error("[Leads] email was not accepted, status", response.status);
+      console.error(`[Leads] ${label} was not accepted, status`, response.status);
       return "failed";
     }
     return "sent";
   } catch (error) {
-    console.error("[Leads] email could not be sent", error instanceof Error ? error.name : "unknown error");
+    console.error(`[Leads] ${label} could not be sent`, error instanceof Error ? error.name : "unknown error");
     return "failed";
   }
+}
+
+/**
+ * Emails a sign-up to the addresses in LEADS_NOTIFY_EMAILS. Does nothing until
+ * a mail key, LEADS_FROM_EMAIL and LEADS_NOTIFY_EMAILS are all set. The lead is
+ * already saved by the time this runs, so a failure here loses an email, never
+ * a lead.
+ */
+export async function sendLeadEmail(
+  lead: LeadMail,
+  env: Record<string, string | undefined> = process.env,
+  send: typeof fetch = fetch
+): Promise<"sent" | "not_configured" | "failed"> {
+  const sender = parseSender(env.LEADS_FROM_EMAIL);
+  const to = parseRecipients(env.LEADS_NOTIFY_EMAILS);
+  if (!sender || to.length === 0 || (!env.BREVO_API_KEY && !env.RESEND_API_KEY)) return "not_configured";
+  return deliverMail({ to, replyTo: lead.email, ...buildLeadEmail(lead) }, sender, env, send, "email");
+}
+
+/**
+ * Sends the person who signed up the welcome email, worded for the plan and
+ * team size they picked. Replies go to LEADS_REPLY_TO, or else to the first
+ * address in LEADS_NOTIFY_EMAILS, so "just reply" reaches a person.
+ *
+ * Optional settings: WELCOME_CTA_URL for the button (a booking page; without
+ * it the button opens a reply to that same address), EMAIL_ASSET_BASE_URL for
+ * where the logos live, and WELCOME_EMAIL=off to stop sending it.
+ */
+export async function sendWelcomeEmail(
+  lead: LeadMail,
+  env: Record<string, string | undefined> = process.env,
+  send: typeof fetch = fetch
+): Promise<"sent" | "not_configured" | "off" | "failed"> {
+  if ((env.WELCOME_EMAIL ?? "").trim().toLowerCase() === "off") return "off";
+  const sender = parseSender(env.LEADS_FROM_EMAIL);
+  if (!sender || (!env.BREVO_API_KEY && !env.RESEND_API_KEY)) return "not_configured";
+  const replyTo = parseRecipients(env.LEADS_REPLY_TO)[0] ?? parseRecipients(env.LEADS_NOTIFY_EMAILS)[0] ?? sender.email;
+  const ctaUrl = (env.WELCOME_CTA_URL ?? "").trim()
+    || `mailto:${replyTo}?subject=${encodeURIComponent(`Setting up Now for ${lead.company.replace(/[\r\n]+/g, " ").trim()}`.slice(0, 150))}`;
+  const mail = buildWelcomeEmail(lead, {
+    assetBase: (env.EMAIL_ASSET_BASE_URL ?? "").trim() || "https://nowhrms.com/email/images",
+    ctaUrl,
+  });
+  return deliverMail({ to: [lead.email], replyTo, ...mail }, sender, env, send, "welcome email");
 }
 
 export const leadsHttpRouter = Router();
@@ -249,9 +297,13 @@ leadsHttpRouter.post("/api/leads", express.json({ limit: "10kb" }), async (req, 
     // A double click or an impatient resubmit should not make two leads.
     const recent = await Lead.findOne({ email: lead.email, createdAt: { $gte: new Date(now - WINDOW_MS) } }).lean();
     if (!recent) {
+      // The welcome goes to an address only once, ever, so the form cannot be
+      // used to send the same stranger mail again and again.
+      const seenBefore = await Lead.exists({ email: lead.email });
       await Lead.create(lead);
       void notifyTeam(lead);
       void sendLeadEmail(lead);
+      if (!seenBefore) void sendWelcomeEmail(lead);
     }
     return res.status(200).json({ ok: true });
   } catch (error) {
