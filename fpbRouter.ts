@@ -18,6 +18,7 @@ import { isOrgWide } from "./roles";
 import { canOpenProjects } from "./departments";
 import { emitNotification } from "./_core/realtime";
 import { storagePut } from "./storage";
+import { deleteRoundsForProject } from "./clientRounds";
 
 const PRIORITY = z.enum(["low", "medium", "high", "urgent"]);
 const WORK_STATUS = z.enum(["todo", "in_progress", "in_review", "blocked", "done"]);
@@ -373,6 +374,10 @@ export const fpbRouter = router({
     .mutation(async ({ ctx, input }) => {
       await requireProjectOwner(ctx, input.id);
       await fpb.deleteProject(input.id);
+      // The project's monthly client rounds, their files and feedback go too.
+      await deleteRoundsForProject(input.id).catch(error =>
+        console.error("[ClientRounds] cleanup after project delete failed", error instanceof Error ? error.name : "unknown error")
+      );
       return { success: true };
     }),
 

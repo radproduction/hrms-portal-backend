@@ -10,6 +10,11 @@
  * marked autoClockedOut, because the person's real finishing time is unknown.
  * The flag is the point: an honest cap that says "a human needs to confirm
  * this" is worth more than a number that looks like a measurement.
+ *
+ * Off by default since October 2026. People who worked past the limit (a late
+ * shift ending after midnight, say) were clocked out at the limit, so their
+ * real clock-out was lost and their times read wrong. Set SHIFT_SWEEP=on to
+ * bring it back.
  */
 import { TimeEntry } from "./models";
 import { connectToMongoDB } from "./mongodb";
@@ -117,9 +122,21 @@ export async function sweepStaleSessions(now: Date = new Date()): Promise<number
 
 let timer: NodeJS.Timeout | undefined;
 
-/** Starts the periodic sweep. Safe to call once at startup. */
-export function startShiftSweep() {
-  if (timer) return;
+/** True only when SHIFT_SWEEP=on; the automatic clock-out is off otherwise. */
+export function shiftSweepEnabled(env: Record<string, string | undefined> = process.env) {
+  return (env.SHIFT_SWEEP ?? "").trim().toLowerCase() === "on";
+}
+
+/**
+ * Starts the periodic sweep when SHIFT_SWEEP=on. Safe to call once at startup.
+ * Returns whether it is running.
+ */
+export function startShiftSweep(env: Record<string, string | undefined> = process.env): boolean {
+  if (timer) return true;
+  if (!shiftSweepEnabled(env)) {
+    console.log("[ShiftSweep] off: sessions stay open until the person clocks out");
+    return false;
+  }
 
   const run = () => {
     // A failed sweep must not take the server down with it.
@@ -136,6 +153,7 @@ export function startShiftSweep() {
   console.log(
     `[ShiftSweep] every ${SWEEP_INTERVAL_MS / 60000}min, closing sessions past ${MAX_SESSION_HOURS}h`
   );
+  return true;
 }
 
 export function stopShiftSweep() {

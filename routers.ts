@@ -24,6 +24,7 @@ import * as departments from "./departments";
 import { routeLeaveFor } from "./leaveRouting";
 import { requestsRouter, timeRouter, wingmanRouter } from "./nowRouter";
 import { leadsRouter } from "./leads";
+import { clientRoundsRouter } from "./clientRounds";
 
 /**
  * Tells each assignee of a legacy project task that it was assigned to them -
@@ -91,6 +92,10 @@ export const appRouter = router({
   // Sign-ups from the public landing page, for admins to read. The page
   // itself posts to POST /api/leads; see leads.ts.
   leads: leadsRouter,
+
+  // Monthly client rounds on a project (report, meeting, invoice, payment)
+  // and the client feedback link for each; see clientRounds.ts.
+  clientRounds: clientRoundsRouter,
 
   // A department head's window onto their own team. Everything else a head can
   // reach is org-wide and refuses them; this is scoped to the departments they

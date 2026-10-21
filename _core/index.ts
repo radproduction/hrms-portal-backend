@@ -15,12 +15,13 @@ import { initRealtime } from "./realtime";
 import { handleWingmanClock, handleWingmanEmployeeData, handleWingmanTeamSnapshot } from "../wingman";
 import { ENV } from "./env";
 import { leadsHttpRouter } from "../leads";
+import { clientFeedbackHttpRouter } from "../clientRounds";
 
 async function startServer() {
   await connectToMongoDB();
 
-  // Sessions nobody clocked out of used to stay open indefinitely, so hours
-  // and attendance drifted further from reality every day.
+  // The automatic clock-out. Off unless SHIFT_SWEEP=on: it was clocking out
+  // people whose shift ran past midnight, so their real times were lost.
   startShiftSweep();
 
   // Bring the board up to the sub-project level: give every existing project a
@@ -77,6 +78,9 @@ async function startServer() {
   // Sign-ups from the public landing page. Public on purpose, and mounted
   // ahead of the 50mb body parser so it can apply its own small limit.
   app.use(leadsHttpRouter);
+  // The client feedback form, opened from a private link without signing in.
+  // Also ahead of the big body parser, for the same reason.
+  app.use(clientFeedbackHttpRouter);
 
   // Configure body parser with larger size limit for file uploads
   app.use(express.json({ limit: "50mb" }));

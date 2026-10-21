@@ -1,11 +1,21 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import mongoose from "mongoose";
 import { TimeEntry, User } from "./models";
-import { decideSweep, sweepStaleSessions, MAX_SESSION_HOURS } from "./shiftSweep";
+import { decideSweep, shiftSweepEnabled, sweepStaleSessions, MAX_SESSION_HOURS } from "./shiftSweep";
 import { describeWithDb } from "./test-utils";
 
 const HOUR = 60 * 60 * 1000;
 const NOW = new Date("2026-09-12T12:00:00.000Z");
+
+describe("shiftSweepEnabled", () => {
+  it("is off unless SHIFT_SWEEP=on", () => {
+    expect(shiftSweepEnabled({})).toBe(false);
+    expect(shiftSweepEnabled({ SHIFT_SWEEP: "" })).toBe(false);
+    expect(shiftSweepEnabled({ SHIFT_SWEEP: "off" })).toBe(false);
+    expect(shiftSweepEnabled({ SHIFT_SWEEP: "yes" })).toBe(false);
+    expect(shiftSweepEnabled({ SHIFT_SWEEP: " ON " })).toBe(true);
+  });
+});
 
 /** Arithmetic only - no database, no real clock. */
 describe("decideSweep", () => {
