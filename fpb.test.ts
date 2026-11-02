@@ -6,6 +6,7 @@ import { Department, Notification, User } from "./models";
 import {
   FpbActivity,
   FpbAnnotation,
+  FpbAttachment,
   FpbColumn,
   FpbLabel,
   FpbProject,
@@ -65,7 +66,7 @@ describeWithDb("Flow Project Board", () => {
       FpbSubtask.deleteMany({}), FpbTaskComment.deleteMany({}), FpbTaskMember.deleteMany({}),
       FpbTask.deleteMany({}), FpbColumn.deleteMany({}), FpbSubproject.deleteMany({}),
       FpbProjectMember.deleteMany({}), FpbActivity.deleteMany({}), FpbAnnotation.deleteMany({}),
-      FpbLabel.deleteMany({}),
+      FpbLabel.deleteMany({}), FpbAttachment.deleteMany({}),
     ]);
     await Promise.all([
       FpbProject.deleteMany({}),
@@ -369,7 +370,7 @@ describeWithDb("Flow Project Board", () => {
     // Being invited into a space is not licence to destroy it.
     await expect(
       asOutsider().fpb.deleteProject({ id: space.id })
-    ).rejects.toThrow(/created this project, or an admin/);
+    ).rejects.toThrow(/created this project/);
 
     await asMember().fpb.deleteProject({ id: space.id });
     expect(await FpbProject.findById(space.id).lean()).toBeNull();
@@ -434,13 +435,22 @@ describeWithDb("Flow Project Board", () => {
     const { project, columns } = await newProject("Owned", [memberId]);
     await expect(
       asMember().fpb.deleteColumn({ id: (columns[1] as any).id })
-    ).rejects.toThrow(/created this project, or an admin/);
+    ).rejects.toThrow(/created this project/);
     const sp = await asMember().fpb.createSubproject({ projectId: project.id, name: "Extra" });
-    await expect(asMember().fpb.deleteSubproject({ id: sp.id })).rejects.toThrow(/created this project, or an admin/);
+    await expect(asMember().fpb.deleteSubproject({ id: sp.id })).rejects.toThrow(/created this project/);
     // Members can still add people, but not take them off.
     await expect(
       asMember().fpb.updateProjectMembers({ projectId: project.id, memberIds: [] })
-    ).rejects.toThrow(/created this project, or an admin/);
+    ).rejects.toThrow(/created this project/);
+  });
+
+  it("lets a department head on the project restructure it, but not one outside it", async () => {
+    const { columns } = await newProject("Head's team", [memberId]);
+    const result = await asHead(memberId).fpb.deleteColumn({ id: (columns[1] as any).id });
+    expect(result.fallbackColumnId).toBeTruthy();
+    await expect(
+      asHead(outsiderId).fpb.deleteColumn({ id: (columns[2] as any).id })
+    ).rejects.toThrow(/not on this project/);
   });
 
   it("refuses a task filed under another project's column", async () => {
@@ -528,7 +538,7 @@ describeWithDb("Flow Project Board", () => {
     expect((board.labels as any[]).map(l => l.name)).toEqual(["Urgent"]);
 
     // Deleting a label is the owner's call, and takes it off the cards.
-    await expect(asMember().fpb.deleteLabel({ id: urgent.id })).rejects.toThrow(/created this project, or an admin/);
+    await expect(asMember().fpb.deleteLabel({ id: urgent.id })).rejects.toThrow(/created this project/);
     await asAdmin().fpb.deleteLabel({ id: urgent.id });
     expect((await FpbTask.findById(task.id).lean())!.labelIds).toEqual([]);
   });
@@ -579,6 +589,28 @@ describeWithDb("Flow Project Board", () => {
     expect(actions).toContain("commented on");
   });
 
+  it("lists a card's files and lets only the uploader or a manager remove one", async () => {
+    const { project } = await newProject("Files", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    const record = await FpbAttachment.create({
+      projectId: project.id, taskId: task.id, fileName: "brief.pdf", mimeType: "application/pdf",
+      size: 10, storageKey: `fpb-attachments/${project.id}/test-missing-file`, isImage: false,
+      uploadedBy: adminId,
+    });
+
+    const seen = (await asMember().fpb.getTask({ id: task.id })) as any;
+    expect(seen.attachments.map((a: any) => a.fileName)).toEqual(["brief.pdf"]);
+    // The storage path never leaves the server.
+    expect(seen.attachments[0].storageKey).toBeUndefined();
+
+    const board = await asMember().fpb.getBoard({ projectId: project.id });
+    expect((board.tasks[0] as any).attachmentCount).toBe(1);
+
+    await expect(asMember().fpb.deleteAttachment({ id: String(record._id) })).rejects.toThrow(/created this project/);
+    await asAdmin().fpb.deleteAttachment({ id: String(record._id) });
+    expect(await FpbAttachment.countDocuments({ taskId: task.id })).toBe(0);
+  });
+
   // ---------------------------------------------------------- completion
 
   it("credits a completed task to its assignee, and clears it on reopen", async () => {
@@ -594,6 +626,27 @@ describeWithDb("Flow Project Board", () => {
     stored = (await FpbTask.findById(task.id).lean())!;
     expect(stored.completedBy).toBeUndefined();
     expect(stored.completedAt).toBeUndefined();
+  });
+
+  it("reports a project's completed tasks per employee for the month", async () => {
+    const { project } = await newProject("Perf", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "Ship it", assignedTo: memberId });
+    await asAdmin().fpb.updateTask({ id: task.id, completed: true });
+
+    const now = new Date();
+    const report = await asMember().fpb.getPerformance({
+      month: Number(new Intl.DateTimeFormat("en-CA", { month: "numeric", timeZone: "Asia/Karachi" }).format(now)),
+      year: Number(new Intl.DateTimeFormat("en-CA", { year: "numeric", timeZone: "Asia/Karachi" }).format(now)),
+      projectId: project.id,
+    });
+    const mine = report.departments.flatMap(d => d.employees).find(e => e.userId === memberId)!;
+    expect(mine.completed).toBe(1);
+    expect(mine.projects[0].title).toBe("Perf");
+
+    // An outsider cannot read a project they are not on.
+    await expect(
+      asOutsider().fpb.getPerformance({ month: 1, year: 2026, projectId: project.id })
+    ).rejects.toThrow(/not on this project/);
   });
 
   // ------------------------------------------------------------- uploads

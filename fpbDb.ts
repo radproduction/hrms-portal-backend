@@ -12,6 +12,7 @@ import { User } from "./models";
 import {
   FpbActivity,
   FpbAnnotation,
+  FpbAttachment,
   FpbAnnotationComment,
   FpbColumn,
   FpbLabel,
@@ -25,6 +26,7 @@ import {
   FpbTaskMember,
 } from "./fpbModels";
 import { completionStamp, planColumnOrder } from "./fpbRules";
+import { storageDelete } from "./storage";
 
 async function requireDb() {
   const connected = await connectToMongoDB();
@@ -548,6 +550,7 @@ export async function deleteProject(id: string) {
   const taskIds = tasks.map(t => t._id);
   const subtasks = await FpbSubtask.find({ taskId: { $in: taskIds } }, { _id: 1 }).lean();
   const annotations = await FpbAnnotation.find({ projectId }, { _id: 1 }).lean();
+  await removeAttachmentFiles({ projectId });
 
   await Promise.all([
     FpbSubtaskComment.deleteMany({ subtaskId: { $in: subtasks.map(s => s._id) } }),
@@ -686,9 +689,13 @@ export async function getTasks(projectId: string, subprojectId?: string) {
   if (tasks.length === 0) return [];
 
   const taskIds = tasks.map(t => t._id);
-  const [subtasks, members, commentCounts] = await Promise.all([
+  const [subtasks, members, attachments, commentCounts] = await Promise.all([
     FpbSubtask.find({ taskId: { $in: taskIds } }).sort({ position: 1 }).lean(),
     FpbTaskMember.find({ taskId: { $in: taskIds } }).lean(),
+    // How many files a card has, and its newest image for the cover.
+    FpbAttachment.find({ taskId: { $in: taskIds } }, { taskId: 1, isImage: 1, createdAt: 1 })
+      .sort({ createdAt: 1 })
+      .lean(),
     // The card shows how many (live) comments a task has.
     FpbTaskComment.aggregate<{ _id: unknown; n: number }>([
       { $match: { taskId: { $in: taskIds }, deletedAt: { $exists: false } } },
@@ -696,6 +703,14 @@ export async function getTasks(projectId: string, subprojectId?: string) {
     ]),
   ]);
   const commentsByTask = new Map(commentCounts.map(c => [String(c._id), c.n]));
+  const filesByTask = new Map<string, { count: number; cover: string | null }>();
+  for (const a of attachments) {
+    const key = String(a.taskId);
+    const entry = filesByTask.get(key) ?? { count: 0, cover: null };
+    entry.count += 1;
+    if (a.isImage) entry.cover = String(a._id);
+    filesByTask.set(key, entry);
+  }
 
   const subtasksByTask = new Map<string, unknown[]>();
   for (const s of subtasks) {
@@ -718,6 +733,8 @@ export async function getTasks(projectId: string, subprojectId?: string) {
     subtasks: subtasksByTask.get(String(t._id)) ?? [],
     memberIds: membersByTask.get(String(t._id)) ?? [],
     commentCount: commentsByTask.get(String(t._id)) ?? 0,
+    attachmentCount: filesByTask.get(String(t._id))?.count ?? 0,
+    coverAttachmentId: filesByTask.get(String(t._id))?.cover ?? null,
   }));
 }
 
@@ -726,12 +743,13 @@ export async function getTask(id: string) {
   const task = await FpbTask.findById(toObjectId(id)).lean();
   if (!task) return null;
 
-  const [subtasks, members, comments, activity] = await Promise.all([
+  const [subtasks, members, comments, activity, attachments] = await Promise.all([
     FpbSubtask.find({ taskId: task._id }).sort({ position: 1 }).lean(),
     FpbTaskMember.find({ taskId: task._id }).lean(),
     FpbTaskComment.find({ taskId: task._id }).sort({ createdAt: 1 }).lean(),
     // The card's own history, shown alongside its comments.
     FpbActivity.find({ taskId: task._id }).sort({ createdAt: -1 }).limit(50).lean(),
+    FpbAttachment.find({ taskId: task._id }, { storageKey: 0 }).sort({ createdAt: 1 }).lean(),
   ]);
 
   return {
@@ -741,6 +759,7 @@ export async function getTask(id: string) {
     memberIds: members.map(m => String(m.userId)),
     comments: normalizeAll(comments),
     activity: normalizeAll(activity),
+    attachments: normalizeAll(attachments),
   };
 }
 
@@ -755,6 +774,7 @@ export async function createTask(input: {
   assignedTo?: string;
   createdBy: string;
   memberIds?: string[];
+  labelIds?: string[];
 }) {
   await requireDb();
   const projectId = toObjectId(input.projectId);
@@ -789,6 +809,7 @@ export async function createTask(input: {
     assignedTo: input.assignedTo ? toObjectId(input.assignedTo) : undefined,
     position,
     createdBy: toObjectId(input.createdBy),
+    labelIds: [...new Set(input.labelIds ?? [])].filter(isValidId),
   });
 
   if (input.memberIds?.length) {
@@ -854,6 +875,7 @@ export async function deleteTask(id: string) {
   await requireDb();
   const taskId = toObjectId(id);
   const subtasks = await FpbSubtask.find({ taskId }, { _id: 1 }).lean();
+  await removeAttachmentFiles({ taskId });
   await Promise.all([
     FpbSubtaskComment.deleteMany({ subtaskId: { $in: subtasks.map(s => s._id) } }),
     FpbSubtask.deleteMany({ taskId }),
@@ -1003,6 +1025,123 @@ export async function deleteSubtaskComment(id: string, actorId: string) {
     { $set: { deletedAt: new Date(), deletedBy: toObjectId(actorId) } }
   );
   return res.modifiedCount > 0;
+}
+
+// ==================== Performance ====================
+
+/**
+ * The tasks a monthly performance report needs: completed in the period (or,
+ * for tasks finished before completion was recorded, last touched in it), and
+ * everything still open with an assignee.
+ */
+export async function getPerformanceTasks(input: { start: Date; end: Date; projectId?: string }) {
+  await requireDb();
+  const range = { $gte: input.start, $lte: input.end };
+  const filter: Record<string, unknown> = {
+    $or: [
+      { completed: true, completedAt: range },
+      { completed: true, completedAt: { $exists: false }, updatedAt: range },
+      { completed: false, assignedTo: { $ne: null } },
+    ],
+  };
+  if (input.projectId) filter.projectId = toObjectId(input.projectId);
+
+  const tasks = await FpbTask.find(filter, {
+    projectId: 1, title: 1, assignedTo: 1, completed: 1, completedAt: 1, completedBy: 1,
+    dueDate: 1, updatedAt: 1,
+  }).lean();
+  if (tasks.length === 0) return [];
+
+  const projects = await FpbProject.find(
+    { _id: { $in: [...new Set(tasks.map(t => String(t.projectId)))] } },
+    { title: 1 }
+  ).lean();
+  const titleOf = new Map(projects.map(p => [String(p._id), p.title]));
+
+  return tasks.map(t => ({
+    id: String(t._id),
+    projectId: String(t.projectId),
+    projectTitle: titleOf.get(String(t.projectId)) ?? "Project",
+    title: t.title,
+    assignedTo: t.assignedTo ? String(t.assignedTo) : null,
+    completed: Boolean(t.completed),
+    completedAt: t.completedAt ?? null,
+    completedBy: t.completedBy ? String(t.completedBy) : null,
+    dueDate: t.dueDate ?? null,
+    updatedAt: (t as any).updatedAt ?? null,
+  }));
+}
+
+/** Name, position and department of the given people (all people when omitted). */
+export async function getPeopleForMetrics(userIds?: string[]) {
+  await requireDb();
+  const filter = userIds ? { _id: { $in: userIds.filter(isValidId) } } : {};
+  const users = await User.find(filter, { name: 1, employeeId: 1, position: 1, departmentId: 1, role: 1 }).lean();
+  return users.map(u => ({
+    id: String(u._id),
+    name: u.name || u.employeeId || "Employee",
+    position: u.position ?? "",
+    departmentId: u.departmentId ? String(u.departmentId) : null,
+  }));
+}
+
+/** Everyone in the given departments. */
+export async function getPeopleInDepartments(departmentIds: string[]) {
+  await requireDb();
+  const users = await User.find(
+    { departmentId: { $in: departmentIds.filter(isValidId) } },
+    { _id: 1 }
+  ).lean();
+  return users.map(u => String(u._id));
+}
+
+// ==================== Attachments ====================
+
+export async function createAttachment(input: {
+  projectId: string;
+  taskId: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  storageKey: string;
+  isImage: boolean;
+  uploadedBy: string;
+}) {
+  await requireDb();
+  const created = await FpbAttachment.create({
+    ...input,
+    projectId: toObjectId(input.projectId),
+    taskId: toObjectId(input.taskId),
+    uploadedBy: toObjectId(input.uploadedBy),
+  });
+  const { storageKey: _key, ...rest } = normalize(created)!;
+  return rest;
+}
+
+/** The full record, storage key included, for serving or deleting the file. */
+export async function getAttachment(id: string) {
+  await requireDb();
+  return normalize(await FpbAttachment.findById(toObjectId(id)).lean());
+}
+
+export async function deleteAttachment(id: string) {
+  await requireDb();
+  const found = await FpbAttachment.findById(toObjectId(id)).lean();
+  if (!found) return false;
+  await storageDelete(found.storageKey).catch(error =>
+    console.error("[FPB] could not remove attachment file", error instanceof Error ? error.name : "unknown")
+  );
+  await FpbAttachment.deleteOne({ _id: found._id });
+  return true;
+}
+
+/** Removes the files (and records) of a task's or a project's attachments. */
+async function removeAttachmentFiles(filter: { taskId?: unknown; projectId?: unknown }) {
+  const files = await FpbAttachment.find(filter as any, { storageKey: 1 }).lean();
+  for (const f of files) {
+    await storageDelete(f.storageKey).catch(() => false);
+  }
+  if (files.length > 0) await FpbAttachment.deleteMany(filter as any);
 }
 
 // ==================== Annotations ====================

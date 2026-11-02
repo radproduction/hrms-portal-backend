@@ -54,6 +54,20 @@ export async function storageGet(
 }
 
 /**
+ * Absolute path of a stored file, refusing anything that resolves outside
+ * UPLOADS_DIR (a key containing "../").
+ */
+export function storagePath(relKey: string): string {
+  const key = normalizeKey(relKey);
+  const filePath = path.resolve(UPLOADS_DIR, key);
+  const root = path.resolve(UPLOADS_DIR);
+  if (!filePath.startsWith(root + path.sep)) {
+    throw new Error("Refusing to read outside the uploads directory");
+  }
+  return filePath;
+}
+
+/**
  * Removes an uploaded file. Returns false when there was nothing to remove,
  * so a caller tidying up after a deleted record does not have to treat an
  * already-missing file as a failure.

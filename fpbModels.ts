@@ -342,6 +342,44 @@ export const FpbSubtaskComment = model<IFpbSubtaskComment>(
   fpbSubtaskCommentSchema
 );
 
+// ==================== Task attachments ====================
+// Files on a card. Any format; stored under UPLOADS_DIR but never served from
+// the public /uploads path - only through the signed-in, access-checked route
+// in fpbAttachments.ts.
+export interface IFpbAttachment extends Document {
+  _id: Types.ObjectId;
+  projectId: Types.ObjectId;
+  taskId: Types.ObjectId;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  /** Path under UPLOADS_DIR. */
+  storageKey: string;
+  /** A real PNG/JPEG/GIF/WebP (checked by its bytes): shown inline and as the card cover. */
+  isImage: boolean;
+  uploadedBy: Types.ObjectId;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const fpbAttachmentSchema = new Schema<IFpbAttachment>(
+  {
+    projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
+    taskId: { type: Schema.Types.ObjectId, ref: "FpbTask", required: true },
+    fileName: { type: String, required: true },
+    mimeType: { type: String, default: "application/octet-stream" },
+    size: { type: Number, required: true },
+    storageKey: { type: String, required: true },
+    isImage: { type: Boolean, default: false },
+    uploadedBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+  },
+  { timestamps: true }
+);
+fpbAttachmentSchema.index({ taskId: 1, createdAt: 1 });
+fpbAttachmentSchema.index({ projectId: 1 });
+
+export const FpbAttachment = model<IFpbAttachment>("FpbAttachment", fpbAttachmentSchema);
+
 // ==================== Design annotations ====================
 export interface IFpbAnnotation extends Document {
   _id: Types.ObjectId;

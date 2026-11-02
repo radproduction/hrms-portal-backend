@@ -1,12 +1,14 @@
 import "dotenv/config";
 import express from "express";
 import { createServer } from "http";
+import path from "node:path";
 import cors from "cors";
 import { createExpressMiddleware } from "@trpc/server/adapters/express";
 import { appRouter } from "../routers";
 import { createContext } from "./context";
 import avatarUploadRouter from "../avatar-upload";
 import employeeDocumentUploadRouter from "../employee-document-upload";
+import fpbAttachmentsRouter, { ATTACHMENTS_PREFIX } from "../fpbAttachments";
 import { connectToMongoDB } from "../mongodb";
 import { UPLOADS_DIR } from "../storage";
 import { startShiftSweep } from "../shiftSweep";
@@ -86,12 +88,33 @@ async function startServer() {
   app.use(express.json({ limit: "50mb" }));
   app.use(express.urlencoded({ limit: "50mb", extended: true }));
   // Serve uploaded files from the same directory storagePut writes to.
+  // Board attachments live under UPLOADS_DIR too, but are private: they are only
+  // served through /api/fpb/attachments/:id, which checks who is asking.
+  // The check works on the decoded, normalised path, so "%2D" or "./" tricks
+  // cannot reach the folder through the static server.
+  app.use("/uploads", (req, res, next) => {
+    let decoded: string;
+    try {
+      decoded = decodeURIComponent(req.path);
+    } catch {
+      res.status(400).end();
+      return;
+    }
+    const normalised = path.posix.normalize(decoded.replace(/\\/g, "/")).replace(/^\/+/, "").toLowerCase();
+    if (normalised.startsWith(ATTACHMENTS_PREFIX)) {
+      res.status(404).end();
+      return;
+    }
+    next();
+  });
   app.use("/uploads", express.static(UPLOADS_DIR));
   console.log(`[Uploads] serving ${UPLOADS_DIR}`);
   // Avatar upload endpoint
   app.use(avatarUploadRouter);
   // Employee document upload endpoint
   app.use(employeeDocumentUploadRouter);
+  // Files on project-board cards (upload and signed-in download).
+  app.use(fpbAttachmentsRouter);
   // Wingman, the WhatsApp assistant, clocking someone in or out. Registered
   // straight on the app ahead of any session auth, because Wingman proves
   // itself with X-Wingman-Secret instead. The logic lives in wingman.ts.

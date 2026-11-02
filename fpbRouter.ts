@@ -18,8 +18,10 @@ import { TRPCError } from "@trpc/server";
 import { protectedProcedure, router } from "./_core/trpc";
 import * as fpb from "./fpbDb";
 import * as db from "./db";
-import { isOrgWide } from "./roles";
-import { canOpenProjects } from "./departments";
+import { isAnyHead, isOrgWide } from "./roles";
+import { canOpenProjects, departmentsLedBy, listDepartments } from "./departments";
+import { getMonthRange } from "./attendance";
+import { summarizePerformance } from "./fpbMetrics";
 import { emitNotification } from "./_core/realtime";
 import { storagePut } from "./storage";
 import { deleteRoundsForProject } from "./clientRounds";
@@ -50,7 +52,7 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
  * This is also the read gate: a project is private to the people in it, and
  * "adding" someone would mean nothing if outsiders could open it anyway.
  */
-async function requireProjectAccess(
+export async function requireProjectAccess(
   ctx: { user: { id: string; role?: string } },
   projectId: string
 ) {
@@ -69,20 +71,21 @@ async function requireProjectAccess(
  * Deleting a whole space is the owner's call, not every member's — otherwise
  * anyone you invited could destroy the space you made.
  */
-async function requireProjectOwner(
+export async function requireProjectOwner(
   ctx: { user: { id: string; role?: string } },
   projectId: string
 ) {
   const project = await fpb.getProject(projectId);
   if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
   if (isOrgWide(ctx.user.role)) return project;
-  if (String((project as any).createdBy) !== ctx.user.id) {
-    throw new TRPCError({
-      code: "FORBIDDEN",
-      message: "Only the person who created this project, or an admin, can do that",
-    });
-  }
-  return project;
+  if (String((project as any).createdBy) === ctx.user.id) return project;
+  // Department heads run their teams' boards: on a project they can open, they
+  // may restructure it too (delete columns, sub-projects, labels, the project).
+  if (isAnyHead(ctx.user.role)) return requireProjectAccess(ctx, projectId);
+  throw new TRPCError({
+    code: "FORBIDDEN",
+    message: "Only the person who created this project, a department head or an admin can do that",
+  });
 }
 
 /** Columns are gated by the project they belong to. */
@@ -628,11 +631,23 @@ export const fpbRouter = router({
         priority: PRIORITY.optional(),
         dueDate: z.date().optional(),
         assignedTo: objectId.optional(),
-        memberIds: z.array(objectId).optional(),
+        memberIds: z.array(objectId).max(50).optional(),
+        labelIds: z.array(objectId).max(20).optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
       const project = await requireProjectAccess(ctx, input.projectId);
+      // Same rules as editing a card: project people only, project labels only.
+      const people = new Set(projectPeople(project));
+      if ([input.assignedTo, ...(input.memberIds ?? [])].some(id => id && !people.has(id))) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Only people on this project can be added to its cards" });
+      }
+      if (input.labelIds?.length) {
+        const own = ((await fpb.getLabels(input.projectId)) as any[]).map(l => String(l.id));
+        if (!labelsBelong(input.labelIds, own)) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Label does not belong to this project" });
+        }
+      }
       // When a sub-project is named it must belong to this project; when it is
       // omitted the data layer files the card under the project's default one.
       if (input.subprojectId) {
@@ -986,6 +1001,74 @@ export const fpbRouter = router({
         throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
       }
       await fpb.deleteSubtaskComment(input.id, ctx.user.id);
+      return { success: true };
+    }),
+
+  // ==================== Performance ====================
+
+  /**
+   * Monthly performance: tasks completed per employee (on time / late), open
+   * and overdue work, by department. For one project, or across all projects:
+   * org-wide roles see everyone, department heads their departments, everyone
+   * else themselves.
+   */
+  getPerformance: protectedProcedure
+    .input(
+      z.object({
+        month: z.number().int().min(1).max(12),
+        year: z.number().int().min(2020).max(2100),
+        projectId: objectId.optional(),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      const { start, end } = getMonthRange(input.month, input.year);
+
+      let userIds: string[] | undefined;
+      if (input.projectId) {
+        const project = await requireProjectAccess(ctx, input.projectId);
+        userIds = [...new Set(projectPeople(project))];
+      } else if (isOrgWide(ctx.user.role)) {
+        userIds = undefined; // everyone
+      } else if (isAnyHead(ctx.user.role)) {
+        const led = await departmentsLedBy(ctx.user.id);
+        userIds = [...new Set([ctx.user.id, ...(await fpb.getPeopleInDepartments(led))])];
+      } else {
+        userIds = [ctx.user.id];
+      }
+
+      const [tasks, users, departments] = await Promise.all([
+        fpb.getPerformanceTasks({ start, end, projectId: input.projectId }),
+        fpb.getPeopleForMetrics(userIds),
+        listDepartments(),
+      ]);
+
+      return summarizePerformance({
+        tasks,
+        users,
+        departments: departments.map(d => ({ id: d.id, name: d.name, headUserId: d.headUserId })),
+        month: input.month,
+        year: input.year,
+        start,
+        end,
+        now: new Date(),
+      });
+    }),
+
+  // ==================== Attachments ====================
+  // Uploading and downloading go through REST (fpbAttachments.ts), since tRPC
+  // does not carry files; listing comes with getTask.
+
+  /** Remove a file from a card: whoever attached it, or the project's managers. */
+  deleteAttachment: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getAttachment(input.id);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Attachment not found" });
+      const projectId = String(found.projectId);
+      await requireProjectAccess(ctx, projectId);
+      if (String(found.uploadedBy) !== ctx.user.id) await requireProjectOwner(ctx, projectId);
+      await fpb.deleteAttachment(input.id);
+      await fpb.logActivity(projectId, ctx.user.id, "removed attachment", String(found.fileName ?? ""), String(found.taskId));
       return { success: true };
     }),
 
