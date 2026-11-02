@@ -45,6 +45,29 @@ fpbColumnSchema.index({ projectId: 1, position: 1 });
 
 export const FpbColumn = model<IFpbColumn>("FpbColumn", fpbColumnSchema);
 
+// ==================== Label ====================
+// Trello-style coloured tags, defined per project and attached to its cards.
+export interface IFpbLabel extends Document {
+  _id: Types.ObjectId;
+  projectId: Types.ObjectId;
+  name: string;
+  color: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const fpbLabelSchema = new Schema<IFpbLabel>(
+  {
+    projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
+    name: { type: String, default: "", trim: true },
+    color: { type: String, required: true },
+  },
+  { timestamps: true }
+);
+fpbLabelSchema.index({ projectId: 1, createdAt: 1 });
+
+export const FpbLabel = model<IFpbLabel>("FpbLabel", fpbLabelSchema);
+
 // ==================== Sub-project ====================
 // A project (a Brand, say "Kunzul Channar") is divided into sub-projects
 // (Social Media, Development, SEO, Marketing). The board runs one sub-project at
@@ -157,6 +180,15 @@ export interface IFpbTask extends Document {
   position: number;
   assignedTo?: Types.ObjectId;
   createdBy: Types.ObjectId;
+  /**
+   * When the task was last completed, and who gets the credit (the assignee at
+   * that moment, else whoever completed it). Cleared on reopen. Feeds the
+   * monthly per-employee performance report.
+   */
+  completedAt?: Date;
+  completedBy?: Types.ObjectId;
+  /** Labels of this card's project (FpbLabel ids). */
+  labelIds: Types.ObjectId[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -176,10 +208,15 @@ const fpbTaskSchema = new Schema<IFpbTask>(
     position: { type: Number, default: 0, required: true },
     assignedTo: { type: Schema.Types.ObjectId, ref: "User" },
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
+    completedAt: Date,
+    completedBy: { type: Schema.Types.ObjectId, ref: "User" },
+    labelIds: { type: [{ type: Schema.Types.ObjectId, ref: "FpbLabel" }], default: [] },
   },
   { timestamps: true }
 );
 fpbTaskSchema.index({ projectId: 1, columnId: 1, position: 1 });
+// Monthly performance: tasks completed by a person within a date range.
+fpbTaskSchema.index({ completedBy: 1, completedAt: 1 });
 // The board sorts one sub-project's cards within each column.
 fpbTaskSchema.index({ subprojectId: 1, columnId: 1, position: 1 });
 
@@ -242,15 +279,33 @@ export interface IFpbTaskComment extends Document {
   taskId: Types.ObjectId;
   userId: Types.ObjectId;
   comment: string;
+  /** Soft delete: the thread keeps "X deleted this comment". */
+  deletedAt?: Date;
+  deletedBy?: Types.ObjectId;
+  /** Set on every edit; earlier versions are kept in `edits`. */
+  editedAt?: Date;
+  edits: { comment: string; editedAt: Date }[];
   createdAt: Date;
   updatedAt: Date;
 }
+
+/** Shared by task and subtask comments. */
+const commentAuditFields = {
+  deletedAt: Date,
+  deletedBy: { type: Schema.Types.ObjectId, ref: "User" },
+  editedAt: Date,
+  edits: {
+    type: [{ comment: { type: String, required: true }, editedAt: { type: Date, required: true }, _id: false }],
+    default: [],
+  },
+};
 
 const fpbTaskCommentSchema = new Schema<IFpbTaskComment>(
   {
     taskId: { type: Schema.Types.ObjectId, ref: "FpbTask", required: true },
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     comment: { type: String, required: true },
+    ...commentAuditFields,
   },
   { timestamps: true }
 );
@@ -263,6 +318,10 @@ export interface IFpbSubtaskComment extends Document {
   subtaskId: Types.ObjectId;
   userId: Types.ObjectId;
   comment: string;
+  deletedAt?: Date;
+  deletedBy?: Types.ObjectId;
+  editedAt?: Date;
+  edits: { comment: string; editedAt: Date }[];
   createdAt: Date;
   updatedAt: Date;
 }
@@ -272,6 +331,7 @@ const fpbSubtaskCommentSchema = new Schema<IFpbSubtaskComment>(
     subtaskId: { type: Schema.Types.ObjectId, ref: "FpbSubtask", required: true },
     userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
     comment: { type: String, required: true },
+    ...commentAuditFields,
   },
   { timestamps: true }
 );
@@ -343,6 +403,8 @@ export const FpbAnnotationComment = model<IFpbAnnotationComment>(
 export interface IFpbActivity extends Document {
   _id: Types.ObjectId;
   projectId: Types.ObjectId;
+  /** Set for actions on one card, so the card can show its own history. */
+  taskId?: Types.ObjectId;
   userId: Types.ObjectId;
   action: string;
   detail?: string;
@@ -351,11 +413,13 @@ export interface IFpbActivity extends Document {
 
 const fpbActivitySchema = new Schema<IFpbActivity>({
   projectId: { type: Schema.Types.ObjectId, ref: "FpbProject", required: true },
+  taskId: { type: Schema.Types.ObjectId, ref: "FpbTask" },
   userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
   action: { type: String, required: true },
   detail: String,
   createdAt: { type: Date, default: Date.now },
 });
 fpbActivitySchema.index({ projectId: 1, createdAt: -1 });
+fpbActivitySchema.index({ taskId: 1, createdAt: -1 }, { sparse: true });
 
 export const FpbActivity = model<IFpbActivity>("FpbActivity", fpbActivitySchema);

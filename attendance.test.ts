@@ -135,6 +135,27 @@ describe("summarizeEmployeeMonth", () => {
     expect(summary.presentDays).toBe(2);
   });
 
+  it("keeps the real clock-in of an auto-closed day, credits no hours and shows no clock-out", () => {
+    const summary = summarizeEmployeeMonth({
+      employee,
+      // Old rows still carry the 12 hours the sweep used to write.
+      entries: [{ ...entryOn("2026-03-02", 12), autoClockedOut: true }],
+      leaveDates: new Set(),
+      month: 3,
+      year: 2026,
+      todayKey: "2026-03-31",
+      offsetMinutes: OFFSET,
+    });
+
+    const day = summary.days.find(d => d.date === "2026-03-02")!;
+    expect(day.timeIn).toBe(new Date("2026-03-02T04:00:00Z").toISOString());
+    expect(day.timeOut).toBeNull();
+    expect(day.missingClockOut).toBe(true);
+    expect(day.hours).toBe(0);
+    expect(summary.totalHours).toBe(0);
+    expect(summary.overtimeHours).toBe(0);
+  });
+
   it("does not flag an ordinary long day as a missing clock-out", () => {
     const summary = summarizeEmployeeMonth({
       employee,

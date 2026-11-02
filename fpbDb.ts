@@ -14,6 +14,7 @@ import {
   FpbAnnotation,
   FpbAnnotationComment,
   FpbColumn,
+  FpbLabel,
   FpbProject,
   FpbProjectMember,
   FpbSubproject,
@@ -23,6 +24,7 @@ import {
   FpbTaskComment,
   FpbTaskMember,
 } from "./fpbModels";
+import { completionStamp, planColumnOrder } from "./fpbRules";
 
 async function requireDb() {
   const connected = await connectToMongoDB();
@@ -175,14 +177,70 @@ export async function getColumnProjectId(id: string) {
   return column ? String(column.projectId) : null;
 }
 
-export async function reorderColumns(items: { id: string; position: number }[]) {
+/**
+ * Puts a project's columns in the given order.
+ *
+ * Takes the whole order rather than individual positions: the request must name
+ * every column of the project exactly once (see planColumnOrder), so the
+ * positions always come out dense, 0..n-1, and a column of another project can
+ * never be moved through this project.
+ */
+export async function reorderColumns(projectId: string, columnIds: string[]) {
   await requireDb();
-  if (items.length === 0) return;
-  await FpbColumn.bulkWrite(
-    items.map(i => ({
-      updateOne: { filter: { _id: toObjectId(i.id) }, update: { position: i.position } },
-    }))
+  const pid = toObjectId(projectId);
+  const existing = await FpbColumn.find({ projectId: pid }, { _id: 1 }).lean();
+  const writes = planColumnOrder(
+    existing.map(c => String(c._id)),
+    columnIds
   );
+  if (writes.length === 0) return [];
+  await FpbColumn.bulkWrite(
+    writes.map(w => ({
+      updateOne: { filter: { _id: toObjectId(w.id), projectId: pid }, update: { position: w.position } },
+    })) as any
+  );
+  return getColumns(projectId);
+}
+
+// ==================== Labels ====================
+
+export async function getLabels(projectId: string) {
+  await requireDb();
+  const labels = await FpbLabel.find({ projectId: toObjectId(projectId) })
+    .sort({ createdAt: 1 })
+    .lean();
+  return normalizeAll(labels);
+}
+
+export async function getLabelProjectId(id: string) {
+  await requireDb();
+  const label = await FpbLabel.findById(toObjectId(id), { projectId: 1 }).lean();
+  return label ? String(label.projectId) : null;
+}
+
+export async function createLabel(projectId: string, name: string, color: string) {
+  await requireDb();
+  const created = await FpbLabel.create({ projectId: toObjectId(projectId), name, color });
+  return normalize(created)!;
+}
+
+export async function updateLabel(id: string, updates: { name?: string; color?: string }) {
+  await requireDb();
+  const payload: Record<string, unknown> = {};
+  if (updates.name !== undefined) payload.name = updates.name;
+  if (updates.color !== undefined) payload.color = updates.color;
+  const saved = await FpbLabel.findByIdAndUpdate(toObjectId(id), payload, {
+    returnDocument: "after",
+  }).lean();
+  return normalize(saved);
+}
+
+/** Removes a label and takes it off every card that carried it. */
+export async function deleteLabel(id: string) {
+  await requireDb();
+  const labelId = toObjectId(id);
+  await FpbTask.updateMany({ labelIds: labelId }, { $pull: { labelIds: labelId } });
+  await FpbLabel.deleteOne({ _id: labelId });
 }
 
 // ==================== Sub-projects ====================
@@ -505,6 +563,7 @@ export async function deleteProject(id: string) {
     FpbProjectMember.deleteMany({ projectId }),
     FpbAnnotation.deleteMany({ projectId }),
     FpbActivity.deleteMany({ projectId }),
+    FpbLabel.deleteMany({ projectId }),
   ]);
   await FpbProject.deleteOne({ _id: projectId });
 }
@@ -627,10 +686,16 @@ export async function getTasks(projectId: string, subprojectId?: string) {
   if (tasks.length === 0) return [];
 
   const taskIds = tasks.map(t => t._id);
-  const [subtasks, members] = await Promise.all([
+  const [subtasks, members, commentCounts] = await Promise.all([
     FpbSubtask.find({ taskId: { $in: taskIds } }).sort({ position: 1 }).lean(),
     FpbTaskMember.find({ taskId: { $in: taskIds } }).lean(),
+    // The card shows how many (live) comments a task has.
+    FpbTaskComment.aggregate<{ _id: unknown; n: number }>([
+      { $match: { taskId: { $in: taskIds }, deletedAt: { $exists: false } } },
+      { $group: { _id: "$taskId", n: { $sum: 1 } } },
+    ]),
   ]);
+  const commentsByTask = new Map(commentCounts.map(c => [String(c._id), c.n]));
 
   const subtasksByTask = new Map<string, unknown[]>();
   for (const s of subtasks) {
@@ -652,6 +717,7 @@ export async function getTasks(projectId: string, subprojectId?: string) {
     ...normalize(t)!,
     subtasks: subtasksByTask.get(String(t._id)) ?? [],
     memberIds: membersByTask.get(String(t._id)) ?? [],
+    commentCount: commentsByTask.get(String(t._id)) ?? 0,
   }));
 }
 
@@ -660,10 +726,12 @@ export async function getTask(id: string) {
   const task = await FpbTask.findById(toObjectId(id)).lean();
   if (!task) return null;
 
-  const [subtasks, members, comments] = await Promise.all([
+  const [subtasks, members, comments, activity] = await Promise.all([
     FpbSubtask.find({ taskId: task._id }).sort({ position: 1 }).lean(),
     FpbTaskMember.find({ taskId: task._id }).lean(),
     FpbTaskComment.find({ taskId: task._id }).sort({ createdAt: 1 }).lean(),
+    // The card's own history, shown alongside its comments.
+    FpbActivity.find({ taskId: task._id }).sort({ createdAt: -1 }).limit(50).lean(),
   ]);
 
   return {
@@ -672,6 +740,7 @@ export async function getTask(id: string) {
     members: normalizeAll(members),
     memberIds: members.map(m => String(m.userId)),
     comments: normalizeAll(comments),
+    activity: normalizeAll(activity),
   };
 }
 
@@ -728,7 +797,11 @@ export async function createTask(input: {
   return normalize(task)!;
 }
 
-export async function updateTask(id: string, updates: Record<string, unknown>) {
+export async function updateTask(
+  id: string,
+  updates: Record<string, unknown>,
+  actorId?: string
+) {
   await requireDb();
   const payload: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(updates)) {
@@ -740,9 +813,38 @@ export async function updateTask(id: string, updates: Record<string, unknown>) {
     payload[k] = v;
   }
 
-  await syncCompletion(payload, () => FpbTask.findById(toObjectId(id), { status: 1 }).lean());
+  const current = await FpbTask.findById(toObjectId(id), {
+    status: 1, completed: 1, assignedTo: 1,
+  }).lean();
+  await syncCompletion(payload, async () => current);
 
-  const saved = await FpbTask.findByIdAndUpdate(toObjectId(id), payload, {
+  // Record who finished it and when, for the monthly performance report.
+  const unset: Record<string, 1> = {};
+  if (current && actorId) {
+    const stamp = completionStamp({
+      wasCompleted: Boolean(current.completed),
+      willBeCompleted: payload.completed as boolean | undefined,
+      assigneeAfter:
+        payload.assignedTo !== undefined
+          ? (payload.assignedTo === null ? null : String(payload.assignedTo))
+          : current.assignedTo
+            ? String(current.assignedTo)
+            : null,
+      actorId,
+    });
+    if (stamp.kind === "set") {
+      payload.completedAt = stamp.completedAt;
+      payload.completedBy = toObjectId(stamp.completedBy);
+    } else if (stamp.kind === "clear") {
+      unset.completedAt = 1;
+      unset.completedBy = 1;
+    }
+  }
+
+  const update: Record<string, unknown> = { $set: payload };
+  if (Object.keys(unset).length > 0) update.$unset = unset;
+
+  const saved = await FpbTask.findByIdAndUpdate(toObjectId(id), update, {
     returnDocument: "after",
   }).lean();
   return normalize(saved);
@@ -833,14 +935,49 @@ export async function addTaskComment(taskId: string, userId: string, comment: st
   return normalize(created)!;
 }
 
-/** Returns false when the comment is not the caller's, so the API can 403. */
-export async function deleteTaskComment(id: string, userId: string) {
+export async function getTaskComment(id: string) {
   await requireDb();
-  const res = await FpbTaskComment.deleteOne({
+  return normalize(await FpbTaskComment.findById(toObjectId(id)).lean());
+}
+
+/**
+ * Edits a comment. Only its author may, and not once it is deleted. The text it
+ * replaces is kept in `edits`, so an edit can never quietly rewrite history.
+ * Returns null when the comment is not the caller's (or is gone).
+ */
+export async function editTaskComment(id: string, userId: string, comment: string) {
+  await requireDb();
+  const existing = await FpbTaskComment.findOne({
     _id: toObjectId(id),
     userId: toObjectId(userId),
-  });
-  return res.deletedCount > 0;
+    deletedAt: { $exists: false },
+  }).lean();
+  if (!existing) return null;
+  if (existing.comment === comment) return normalize(existing)!;
+  const now = new Date();
+  const saved = await FpbTaskComment.findByIdAndUpdate(
+    existing._id,
+    {
+      $set: { comment, editedAt: now },
+      $push: { edits: { comment: existing.comment, editedAt: now } },
+    },
+    { returnDocument: "after" }
+  ).lean();
+  return normalize(saved);
+}
+
+/**
+ * Soft-deletes a comment: the thread keeps a "X deleted this comment" line.
+ * Whether the actor may do it is decided by the caller (canDeleteComment).
+ * Returns false when there was nothing left to delete.
+ */
+export async function deleteTaskComment(id: string, actorId: string) {
+  await requireDb();
+  const res = await FpbTaskComment.updateOne(
+    { _id: toObjectId(id), deletedAt: { $exists: false } },
+    { $set: { deletedAt: new Date(), deletedBy: toObjectId(actorId) } }
+  );
+  return res.modifiedCount > 0;
 }
 
 export async function addSubtaskComment(subtaskId: string, userId: string, comment: string) {
@@ -853,13 +990,19 @@ export async function addSubtaskComment(subtaskId: string, userId: string, comme
   return normalize(created)!;
 }
 
-export async function deleteSubtaskComment(id: string, userId: string) {
+export async function getSubtaskComment(id: string) {
   await requireDb();
-  const res = await FpbSubtaskComment.deleteOne({
-    _id: toObjectId(id),
-    userId: toObjectId(userId),
-  });
-  return res.deletedCount > 0;
+  return normalize(await FpbSubtaskComment.findById(toObjectId(id)).lean());
+}
+
+/** Soft delete, as for task comments. */
+export async function deleteSubtaskComment(id: string, actorId: string) {
+  await requireDb();
+  const res = await FpbSubtaskComment.updateOne(
+    { _id: toObjectId(id), deletedAt: { $exists: false } },
+    { $set: { deletedAt: new Date(), deletedBy: toObjectId(actorId) } }
+  );
+  return res.modifiedCount > 0;
 }
 
 // ==================== Annotations ====================
@@ -962,12 +1105,14 @@ export async function logActivity(
   projectId: string,
   userId: string,
   action: string,
-  detail?: string
+  detail?: string,
+  taskId?: string
 ) {
   // Never let an audit write break the action it is recording.
   try {
     await FpbActivity.create({
       projectId: toObjectId(projectId),
+      taskId: taskId && isValidId(taskId) ? taskId : undefined,
       userId: toObjectId(userId),
       action,
       detail,

@@ -7,6 +7,7 @@ import {
   FpbActivity,
   FpbAnnotation,
   FpbColumn,
+  FpbLabel,
   FpbProject,
   FpbProjectMember,
   FpbSubproject,
@@ -64,6 +65,7 @@ describeWithDb("Flow Project Board", () => {
       FpbSubtask.deleteMany({}), FpbTaskComment.deleteMany({}), FpbTaskMember.deleteMany({}),
       FpbTask.deleteMany({}), FpbColumn.deleteMany({}), FpbSubproject.deleteMany({}),
       FpbProjectMember.deleteMany({}), FpbActivity.deleteMany({}), FpbAnnotation.deleteMany({}),
+      FpbLabel.deleteMany({}),
     ]);
     await Promise.all([
       FpbProject.deleteMany({}),
@@ -387,7 +389,7 @@ describeWithDb("Flow Project Board", () => {
       asMember().fpb.deleteColumn({ id: columnId })
     ).rejects.toThrow(/not on this project/);
     await expect(
-      asMember().fpb.reorderColumns([{ id: columnId, position: 3 }])
+      asMember().fpb.reorderColumns({ projectId: theirs.id, columnIds: [columnId] })
     ).rejects.toThrow(/not on this project/);
   });
 
@@ -401,6 +403,209 @@ describeWithDb("Flow Project Board", () => {
     await expect(
       asMember().fpb.createColumn({ projectId: other.project.id, name: "nope" })
     ).rejects.toThrow(/not on this project/);
+  });
+
+  it("reorders a project's columns and keeps positions dense", async () => {
+    const { project, columns } = await newProject("Order", [memberId]);
+    const ids = columns.map((c: any) => c.id);
+    const reversed = [...ids].reverse();
+    // A member can arrange their own board.
+    const saved = await asMember().fpb.reorderColumns({ projectId: project.id, columnIds: reversed });
+    expect(saved.map((c: any) => c.id)).toEqual(reversed);
+    expect(saved.map((c: any) => c.position)).toEqual(reversed.map((_, i) => i));
+  });
+
+  it("refuses a column order that is incomplete or names another project's column", async () => {
+    const { project, columns } = await newProject("Strict");
+    const other = await newProject("Elsewhere");
+    const ids = columns.map((c: any) => c.id);
+    await expect(
+      asAdmin().fpb.reorderColumns({ projectId: project.id, columnIds: ids.slice(1) })
+    ).rejects.toThrow(/every column/);
+    await expect(
+      asAdmin().fpb.reorderColumns({
+        projectId: project.id,
+        columnIds: [...ids.slice(1), (other.columns[0] as any).id],
+      })
+    ).rejects.toThrow(/every column/);
+  });
+
+  it("leaves deleting a column or sub-project to the owner", async () => {
+    const { project, columns } = await newProject("Owned", [memberId]);
+    await expect(
+      asMember().fpb.deleteColumn({ id: (columns[1] as any).id })
+    ).rejects.toThrow(/created this project, or an admin/);
+    const sp = await asMember().fpb.createSubproject({ projectId: project.id, name: "Extra" });
+    await expect(asMember().fpb.deleteSubproject({ id: sp.id })).rejects.toThrow(/created this project, or an admin/);
+    // Members can still add people, but not take them off.
+    await expect(
+      asMember().fpb.updateProjectMembers({ projectId: project.id, memberIds: [] })
+    ).rejects.toThrow(/created this project, or an admin/);
+  });
+
+  it("refuses a task filed under another project's column", async () => {
+    const { project } = await newProject("Mine");
+    const other = await newProject("Not mine");
+    await expect(
+      asAdmin().fpb.createTask({
+        projectId: project.id, columnId: (other.columns[0] as any).id, title: "stray",
+      })
+    ).rejects.toThrow(/Column does not belong/);
+  });
+
+  // ------------------------------------------------------------- comments
+
+  it("keeps a deleted comment in the thread with who deleted it", async () => {
+    const { project } = await newProject("Talk", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    const c = await asMember().fpb.addTaskComment({ taskId: task.id, comment: "secret plan" });
+
+    await asMember().fpb.deleteTaskComment({ id: c.id });
+
+    const seenByMember = (await asMember().fpb.getTask({ id: task.id })).comments[0] as any;
+    expect(seenByMember.isDeleted).toBe(true);
+    expect(seenByMember.deletedBy).toBe(memberId);
+    expect(seenByMember.comment).toBe("");
+
+    const seenByAdmin = (await asAdmin().fpb.getTask({ id: task.id })).comments[0] as any;
+    expect(seenByAdmin.comment).toBe("secret plan");
+  });
+
+  it("lets only the author edit, and marks the comment edited", async () => {
+    const { project } = await newProject("Edit", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    const c = await asMember().fpb.addTaskComment({ taskId: task.id, comment: "frist" });
+
+    await expect(asAdmin().fpb.editTaskComment({ id: c.id, comment: "hijack" }))
+      .rejects.toThrow(/your own comment/);
+
+    const edited = (await asMember().fpb.editTaskComment({ id: c.id, comment: "first" })) as any;
+    expect(edited.comment).toBe("first");
+    expect(edited.editedAt).toBeTruthy();
+    expect((await FpbTaskComment.findById(c.id).lean())!.edits.map(e => e.comment)).toEqual(["frist"]);
+  });
+
+  it("does not let a member delete someone else's comment, but an admin can", async () => {
+    const { project } = await newProject("Mod", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    const mine = await asAdmin().fpb.addTaskComment({ taskId: task.id, comment: "admin note" });
+    const theirs = await asMember().fpb.addTaskComment({ taskId: task.id, comment: "member note" });
+
+    await expect(asMember().fpb.deleteTaskComment({ id: mine.id })).rejects.toThrow(/your own comment/);
+    await asAdmin().fpb.deleteTaskComment({ id: theirs.id });
+    expect((await FpbTaskComment.findById(theirs.id).lean())!.deletedBy?.toString()).toBe(adminId);
+  });
+
+  it("notifies the people on a card about a new comment, with a link to the task", async () => {
+    const { project } = await newProject("Ping", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t", assignedTo: memberId });
+    await Notification.deleteMany({ userId: { $in: [memberId, adminId] } });
+
+    await asAdmin().fpb.addTaskComment({ taskId: task.id, comment: "please check" });
+
+    const hit = (await Notification.findOne({ userId: memberId, type: "task_comment" }).lean()) as any;
+    expect(hit).toBeTruthy();
+    expect(hit.link).toBe(`/board?project=${project.id}&task=${task.id}`);
+    expect(await Notification.countDocuments({ userId: adminId, type: "task_comment" })).toBe(0);
+  });
+
+  // ------------------------------------------------- labels, members, mentions
+
+  it("puts a project's labels on its cards, and refuses another project's", async () => {
+    const { project } = await newProject("Labels", [memberId]);
+    const other = await newProject("Other labels");
+    const urgent = await asMember().fpb.createLabel({ projectId: project.id, name: "Urgent", color: "#ef4444" });
+    const foreign = await asAdmin().fpb.createLabel({ projectId: other.project.id, name: "X", color: "#000000" });
+    const task = await asMember().fpb.createTask({ projectId: project.id, title: "t" });
+
+    await asMember().fpb.updateTask({ id: task.id, labelIds: [urgent.id] });
+    expect((await FpbTask.findById(task.id).lean())!.labelIds.map(String)).toEqual([urgent.id]);
+    await expect(
+      asMember().fpb.updateTask({ id: task.id, labelIds: [foreign.id] })
+    ).rejects.toThrow(/does not belong/);
+
+    const board = await asMember().fpb.getBoard({ projectId: project.id });
+    expect((board.labels as any[]).map(l => l.name)).toEqual(["Urgent"]);
+
+    // Deleting a label is the owner's call, and takes it off the cards.
+    await expect(asMember().fpb.deleteLabel({ id: urgent.id })).rejects.toThrow(/created this project, or an admin/);
+    await asAdmin().fpb.deleteLabel({ id: urgent.id });
+    expect((await FpbTask.findById(task.id).lean())!.labelIds).toEqual([]);
+  });
+
+  it("only puts project people on a card, and tells the ones added", async () => {
+    const { project } = await newProject("Cards", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    await Notification.deleteMany({ userId: memberId });
+
+    await expect(
+      asAdmin().fpb.updateTaskMembers({ taskId: task.id, memberIds: [outsiderId] })
+    ).rejects.toThrow(/Only people on this project/);
+
+    await asAdmin().fpb.updateTaskMembers({ taskId: task.id, memberIds: [memberId] });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(1);
+  });
+
+  it("notifies a mentioned project member, once, and ignores outsiders", async () => {
+    const { project } = await newProject("Mentions", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "Spec" });
+    await Notification.deleteMany({ userId: { $in: [memberId, outsiderId] } });
+
+    const text = `@[Board Member](user:${memberId}) and @[Outsider](user:${outsiderId}) please look`;
+    const c = await asAdmin().fpb.addTaskComment({ taskId: task.id, comment: text });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_mention" })).toBe(1);
+    expect(await Notification.countDocuments({ userId: outsiderId, type: "task_mention" })).toBe(0);
+
+    // Editing the same comment does not ping them again.
+    await asAdmin().fpb.editTaskComment({ id: c.id, comment: `${text}!` });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_mention" })).toBe(1);
+
+    // A mention in the description counts too.
+    await Notification.deleteMany({ userId: memberId });
+    await asAdmin().fpb.updateTask({ id: task.id, description: `Owner: @[Board Member](user:${memberId})` });
+    expect(await Notification.countDocuments({ userId: memberId, type: "task_mention" })).toBe(1);
+  });
+
+  it("keeps a card's own history", async () => {
+    const { project } = await newProject("History");
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t" });
+    await asAdmin().fpb.updateTask({ id: task.id, priority: "high" });
+    await asAdmin().fpb.addTaskComment({ taskId: task.id, comment: "hi" });
+
+    const { activity } = (await asAdmin().fpb.getTask({ id: task.id })) as any;
+    const actions = activity.map((a: any) => a.action);
+    expect(actions).toContain("added task");
+    expect(actions).toContain("changed the priority");
+    expect(actions).toContain("commented on");
+  });
+
+  // ---------------------------------------------------------- completion
+
+  it("credits a completed task to its assignee, and clears it on reopen", async () => {
+    const { project } = await newProject("Credit", [memberId]);
+    const task = await asAdmin().fpb.createTask({ projectId: project.id, title: "t", assignedTo: memberId });
+
+    await asAdmin().fpb.updateTask({ id: task.id, completed: true });
+    let stored = (await FpbTask.findById(task.id).lean())!;
+    expect(String(stored.completedBy)).toBe(memberId);
+    expect(stored.completedAt).toBeInstanceOf(Date);
+
+    await asAdmin().fpb.updateTask({ id: task.id, completed: false });
+    stored = (await FpbTask.findById(task.id).lean())!;
+    expect(stored.completedBy).toBeUndefined();
+    expect(stored.completedAt).toBeUndefined();
+  });
+
+  // ------------------------------------------------------------- uploads
+
+  it("refuses an annotation that is not really an image", async () => {
+    const { project } = await newProject("Designs");
+    const html = Buffer.from("<html><script>alert(1)</script></html>").toString("base64");
+    await expect(
+      asAdmin().fpb.uploadAnnotation({
+        projectId: project.id, fileName: "x.html", fileBase64: html, mimeType: "image/html",
+      })
+    ).rejects.toThrow(/PNG, JPEG, GIF or WebP/);
   });
 
   // ------------------------------------------------------------ notifications
@@ -439,8 +644,8 @@ describeWithDb("Flow Project Board", () => {
       projectId: project.id, memberIds: [adminId, memberId, outsiderId],
     });
 
-    expect(await Notification.countDocuments({ userId: outsiderId, type: "task_assigned" })).toBe(1);
-    expect(await Notification.countDocuments({ userId: memberId, type: "task_assigned" })).toBe(0);
+    expect(await Notification.countDocuments({ userId: outsiderId, type: "project_member_added" })).toBe(1);
+    expect(await Notification.countDocuments({ userId: memberId, type: "project_member_added" })).toBe(0);
   });
 
   it("never notifies the person who acted", async () => {

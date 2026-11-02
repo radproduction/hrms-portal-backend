@@ -37,7 +37,8 @@ describe("decideSweep", () => {
     const timeIn = ago(30);
     const [decision] = decideSweep([{ id: "a", timeIn }], NOW, 12);
 
-    expect(decision.totalHours).toBe(12);
+    // No hours are credited: the real finishing time is unknown.
+    expect(decision.totalHours).toBe(0);
     expect(decision.timeOut.getTime()).toBe(timeIn.getTime() + 12 * HOUR);
     // Emphatically not "now": the person stopped working long before the
     // sweep noticed, and 30 hours is not a day's work.
@@ -47,12 +48,14 @@ describe("decideSweep", () => {
   it("records the limit however late the sweep runs", () => {
     // The process being down for a week must not turn into a week-long shift.
     const [decision] = decideSweep([{ id: "a", timeIn: ago(24 * 81) }], NOW, 12);
-    expect(decision.totalHours).toBe(12);
+    expect(decision.timeOut.getTime()).toBeLessThan(NOW.getTime() - 24 * 80 * HOUR);
+    expect(decision.totalHours).toBe(0);
   });
 
   it("honours a different limit", () => {
-    const [decision] = decideSweep([{ id: "a", timeIn: ago(10) }], NOW, 8);
-    expect(decision.totalHours).toBe(8);
+    const timeIn = ago(10);
+    const [decision] = decideSweep([{ id: "a", timeIn }], NOW, 8);
+    expect(decision.timeOut.getTime()).toBe(timeIn.getTime() + 8 * HOUR);
   });
 
   it("skips a row with an unusable timeIn instead of writing NaN hours", () => {
@@ -109,8 +112,11 @@ describeWithDb("sweepStaleSessions", () => {
 
     const saved = await TimeEntry.findById(entry._id).lean();
     expect(saved!.status).toBe("completed");
-    expect(saved!.totalHours).toBe(MAX_SESSION_HOURS);
+    expect(saved!.totalHours).toBe(0);
     expect(saved!.autoClockedOut).toBe(true);
+    expect(saved!.autoClockedOutAt).toBeInstanceOf(Date);
+    // The clock-in is left exactly as the person recorded it.
+    expect(new Date(saved!.timeIn).getTime()).toBe(new Date(entry.timeIn).getTime());
     // Closed at the limit after clock-in, so the row cannot claim 30 hours.
     expect(new Date(saved!.timeOut as Date).getTime()).toBe(
       new Date(saved!.timeIn).getTime() + MAX_SESSION_HOURS * HOUR

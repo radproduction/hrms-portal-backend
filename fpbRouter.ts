@@ -8,6 +8,10 @@
  *    deleteColumn, deleteProject and updateProject to any signed-in user, so an
  *    employee could delete the whole board. Columns and project deletion are
  *    admin-only; project edits are limited to admins, the creator, or a member.
+ *
+ * Structural deletes (a column, a sub-project and its cards, removing someone
+ * from the project) are the project owner's or an org-wide role's call; members
+ * can still add and rename columns, reorder them and work the cards.
  */
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
@@ -19,6 +23,19 @@ import { canOpenProjects } from "./departments";
 import { emitNotification } from "./_core/realtime";
 import { storagePut } from "./storage";
 import { deleteRoundsForProject } from "./clientRounds";
+import type { NotificationType } from "./models";
+import {
+  boardLink,
+  canDeleteComment,
+  isLabelColor,
+  labelsBelong,
+  mentionTargets,
+  plainText,
+  presentComment,
+  safeImageExtension,
+  taskAudience,
+  type CommentRecord,
+} from "./fpbRules";
 
 const PRIORITY = z.enum(["low", "medium", "high", "urgent"]);
 const WORK_STATUS = z.enum(["todo", "in_progress", "in_review", "blocked", "done"]);
@@ -92,25 +109,35 @@ async function requireSubprojectAccess(
 
 /**
  * Board changes are only useful if the people affected hear about them, so
- * assignment and membership raise a notification and a realtime ping. Never
- * notify the person who performed the action.
+ * assignment, membership, comments and completion raise a notification and a
+ * realtime ping. Never notify the person who performed the action.
+ *
+ * Every board notification carries a link that opens the project — and the
+ * task, when there is one — so clicking it lands on the card itself.
  */
 async function notify(
   userIds: string[],
   actorId: string,
-  payload: { title: string; message: string; projectId: string }
+  payload: {
+    title: string;
+    message: string;
+    projectId: string;
+    taskId?: string;
+    type?: NotificationType;
+  }
 ) {
   const targets = [...new Set(userIds)].filter(id => id && id !== actorId);
   for (const userId of targets) {
     try {
       await db.createNotification({
         userId,
-        type: "task_assigned",
+        type: payload.type ?? "task_assigned",
         title: payload.title,
         message: payload.message,
         priority: "medium",
-        relatedId: payload.projectId,
-        relatedType: "fpb_project",
+        relatedId: payload.taskId ?? payload.projectId,
+        relatedType: payload.taskId ? "fpb_task" : "fpb_project",
+        link: boardLink(payload.projectId, payload.taskId),
       });
       emitNotification({ userId });
     } catch (error) {
@@ -118,6 +145,69 @@ async function notify(
       console.error("[FPB] failed to notify", userId, error);
     }
   }
+}
+
+/** Short, single-line excerpt of a comment for a notification. */
+function excerpt(text: string, max = 120) {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
+}
+
+/** Everyone who belongs to a project: its creator and its members. */
+function projectPeople(project: any): string[] {
+  return [String(project?.createdBy ?? ""), ...((project?.memberIds ?? []) as string[]).map(String)]
+    .filter(Boolean);
+}
+
+/**
+ * Tells people they were @mentioned. Only project people can be mentioned, only
+ * new mentions ping (an edit does not re-notify), and never the author.
+ */
+async function notifyMentions(input: {
+  before?: string | null;
+  after: string;
+  project: any;
+  projectId: string;
+  taskId: string;
+  taskTitle: string;
+  actor: { id: string; name?: string | null };
+  where: "comment" | "description";
+}) {
+  const targets = mentionTargets({
+    before: input.before,
+    after: input.after,
+    projectPeople: projectPeople(input.project),
+    actorId: input.actor.id,
+  });
+  if (targets.length === 0) return;
+  await notify(targets, input.actor.id, {
+    title: `${input.actor.name ?? "Someone"} mentioned you`,
+    message:
+      input.where === "comment"
+        ? `On "${input.taskTitle}": ${excerpt(plainText(input.after))}`
+        : `In the description of "${input.taskTitle}" (${input.project?.title ?? "project"}).`,
+    projectId: input.projectId,
+    taskId: input.taskId,
+    type: "task_mention",
+  });
+}
+
+/** Words for the activity line of a card edit, e.g. "changed the due date". */
+function describeTaskEdit(updates: Record<string, unknown>): string {
+  const parts: Record<string, string> = {
+    title: "renamed the card",
+    description: "updated the description",
+    status: "changed the status",
+    priority: "changed the priority",
+    dueDate: "changed the due date",
+    assignedTo: "changed the assignee",
+    labelIds: "changed the labels",
+    progress: "updated progress",
+  };
+  const said = Object.keys(updates)
+    .filter(k => updates[k] !== undefined && parts[k])
+    .map(k => parts[k]);
+  return said.length > 0 ? said.join(", ") : "updated the card";
 }
 
 async function projectIdForTask(taskId: string) {
@@ -139,9 +229,10 @@ export const fpbRouter = router({
     .input(z.object({ projectId: objectId, subprojectId: objectId.optional() }))
     .query(async ({ ctx, input }) => {
       const project = await requireProjectAccess(ctx, input.projectId);
-      const [subprojects, columns] = await Promise.all([
+      const [subprojects, columns, labels] = await Promise.all([
         fpb.getSubprojects(input.projectId),
         fpb.getColumns(input.projectId),
+        fpb.getLabels(input.projectId),
       ]);
       // Resolve the sub-project to display: the requested one if it belongs to
       // this project, otherwise the first. Every project has at least one.
@@ -155,6 +246,7 @@ export const fpbRouter = router({
         subprojects,
         activeSubprojectId: active ? (active.id as string) : null,
         columns,
+        labels,
         tasks,
       };
     }),
@@ -204,6 +296,8 @@ export const fpbRouter = router({
     .input(z.object({ id: objectId }))
     .mutation(async ({ ctx, input }) => {
       const projectId = await requireSubprojectAccess(ctx, input.id);
+      // Deleting a sub-project deletes every card in it.
+      await requireProjectOwner(ctx, projectId);
       try {
         const result = await fpb.deleteSubproject(input.id);
         await fpb.logActivity(projectId, ctx.user.id, "deleted sub-project");
@@ -248,7 +342,8 @@ export const fpbRouter = router({
   deleteColumn: protectedProcedure
     .input(z.object({ id: objectId }))
     .mutation(async ({ ctx, input }) => {
-      await requireColumnAccess(ctx, input.id);
+      const projectId = await requireColumnAccess(ctx, input.id);
+      await requireProjectOwner(ctx, projectId);
       try {
         // Tasks move to the neighbouring column rather than being orphaned.
         return await fpb.deleteColumn(input.id);
@@ -260,11 +355,65 @@ export const fpbRouter = router({
       }
     }),
 
+  /**
+   * The new left-to-right order of a project's columns. Must list every column
+   * of the project exactly once; positions are rewritten as 0..n-1.
+   */
   reorderColumns: protectedProcedure
-    .input(z.array(z.object({ id: objectId, position: z.number().int().min(0) })))
+    .input(z.object({ projectId: objectId, columnIds: z.array(objectId).min(1).max(50) }))
     .mutation(async ({ ctx, input }) => {
-      for (const item of input) await requireColumnAccess(ctx, item.id);
-      await fpb.reorderColumns(input);
+      await requireProjectAccess(ctx, input.projectId);
+      try {
+        const columns = await fpb.reorderColumns(input.projectId, input.columnIds);
+        await fpb.logActivity(input.projectId, ctx.user.id, "reordered columns");
+        return columns;
+      } catch (error) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: error instanceof Error ? error.message : "Could not reorder the columns",
+        });
+      }
+    }),
+
+  // ==================== Labels ====================
+
+  createLabel: protectedProcedure
+    .input(
+      z.object({
+        projectId: objectId,
+        name: z.string().trim().max(40).default(""),
+        color: z.string().refine(isLabelColor, "Colour must be #rrggbb"),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      return fpb.createLabel(input.projectId, input.name, input.color);
+    }),
+
+  updateLabel: protectedProcedure
+    .input(
+      z.object({
+        id: objectId,
+        name: z.string().trim().max(40).optional(),
+        color: z.string().refine(isLabelColor, "Colour must be #rrggbb").optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await fpb.getLabelProjectId(input.id);
+      if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "Label not found" });
+      await requireProjectAccess(ctx, projectId);
+      const { id, ...updates } = input;
+      return fpb.updateLabel(id, updates);
+    }),
+
+  /** Deleting a label takes it off every card; the project owner's call. */
+  deleteLabel: protectedProcedure
+    .input(z.object({ id: objectId }))
+    .mutation(async ({ ctx, input }) => {
+      const projectId = await fpb.getLabelProjectId(input.id);
+      if (!projectId) throw new TRPCError({ code: "NOT_FOUND", message: "Label not found" });
+      await requireProjectOwner(ctx, projectId);
+      await fpb.deleteLabel(input.id);
       return { success: true };
     }),
 
@@ -345,6 +494,7 @@ export const fpbRouter = router({
         title: "Added to a project",
         message: `You have been added to ${input.title}.`,
         projectId: project.id!,
+        type: "project_member_added",
       });
       return project;
     }),
@@ -396,7 +546,7 @@ export const fpbRouter = router({
       try {
         const moved = await fpb.moveTask(input.id, input.columnId, input.position);
         if (!moved) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
-        await fpb.logActivity(projectId, ctx.user.id, "moved task", moved.title as string);
+        await fpb.logActivity(projectId, ctx.user.id, "moved task", moved.title as string, input.id);
         return moved;
       } catch (error) {
         if (error instanceof TRPCError) throw error;
@@ -408,19 +558,34 @@ export const fpbRouter = router({
     }),
 
   updateProjectMembers: protectedProcedure
-    .input(z.object({ projectId: objectId, memberIds: z.array(objectId) }))
+    .input(z.object({ projectId: objectId, memberIds: z.array(objectId).max(500) }))
     .mutation(async ({ ctx, input }) => {
       const project = await requireProjectAccess(ctx, input.projectId);
       const before: string[] = ((project as any).memberIds ?? []) as string[];
+
+      // Any member may bring people in; taking someone off the project is the
+      // owner's (or an org-wide role's) decision.
+      const removed = before.filter(id => !input.memberIds.includes(id));
+      if (removed.length > 0) await requireProjectOwner(ctx, input.projectId);
+
+      // Only real people: an unknown id would make a member row for nobody.
+      const added = [...new Set<string>(input.memberIds)].filter(id => !before.includes(id));
+      if (added.length > 0) {
+        const known = new Set(((await fpb.getBoardUsers()) as any[]).map(u => String(u.id)));
+        const unknown = added.filter(id => !known.has(id));
+        if (unknown.length > 0) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "One of those people does not exist" });
+        }
+      }
+
       const saved = await fpb.setProjectMembers(input.projectId, input.memberIds);
       await fpb.logActivity(input.projectId, ctx.user.id, "updated members");
 
-      // Only the people who were not already on it.
-      const added = saved.filter(id => !before.includes(id));
       await notify(added, ctx.user.id, {
         title: "Added to a project",
         message: `You have been added to ${(project as any).title}.`,
         projectId: input.projectId,
+        type: "project_member_added",
       });
       return { memberIds: saved };
     }),
@@ -440,7 +605,13 @@ export const fpbRouter = router({
       const found = await fpb.getTask(input.id);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
       await requireProjectAccess(ctx, String((found.task as any).projectId));
-      return found;
+      // Deleted comments keep their place in the thread; their text (and the
+      // history of edited ones) only reaches org-wide roles.
+      const orgWide = isOrgWide(ctx.user.role);
+      return {
+        ...found,
+        comments: (found.comments as unknown as CommentRecord[]).map(c => presentComment(c, orgWide)),
+      };
     }),
 
   createTask: protectedProcedure
@@ -453,7 +624,7 @@ export const fpbRouter = router({
         // Omitted means the first column, so a card always lands on the board.
         columnId: objectId.optional(),
         title: z.string().min(1).max(500),
-        description: z.string().optional(),
+        description: z.string().max(20000).optional(),
         priority: PRIORITY.optional(),
         dueDate: z.date().optional(),
         assignedTo: objectId.optional(),
@@ -473,8 +644,29 @@ export const fpbRouter = router({
           });
         }
       }
+      // Same for the column: a card must not be filed on another project's board.
+      if (input.columnId) {
+        const colProjectId = await fpb.getColumnProjectId(input.columnId);
+        if (colProjectId !== input.projectId) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Column does not belong to this project",
+          });
+        }
+      }
       const task = await fpb.createTask({ ...input, createdBy: ctx.user.id });
-      await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title);
+      await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title, task.id);
+      if (input.description) {
+        await notifyMentions({
+          after: input.description,
+          project,
+          projectId: input.projectId,
+          taskId: task.id,
+          taskTitle: input.title,
+          actor: ctx.user,
+          where: "description",
+        });
+      }
 
       await notify(
         [input.assignedTo ?? "", ...(input.memberIds ?? [])],
@@ -483,6 +675,7 @@ export const fpbRouter = router({
           title: "New task assigned",
           message: `You have been assigned "${input.title}" in ${(project as any).title}.`,
           projectId: input.projectId,
+          taskId: task.id,
         }
       );
       return task;
@@ -493,13 +686,14 @@ export const fpbRouter = router({
       z.object({
         id: objectId,
         title: z.string().min(1).max(500).optional(),
-        description: z.string().optional(),
+        description: z.string().max(20000).optional(),
         completed: z.boolean().optional(),
         status: WORK_STATUS.optional(),
         progress: z.number().int().min(0).max(100).optional(),
         priority: PRIORITY.optional(),
         dueDate: z.date().nullable().optional(),
         assignedTo: objectId.nullable().optional(),
+        labelIds: z.array(objectId).max(20).optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
@@ -508,9 +702,43 @@ export const fpbRouter = router({
       const projectId = String((before.task as any).projectId);
       const project = await requireProjectAccess(ctx, projectId);
 
+      // A card can only carry its own project's labels.
+      if (input.labelIds) {
+        input.labelIds = [...new Set<string>(input.labelIds)];
+        const own = ((await fpb.getLabels(projectId)) as any[]).map(l => String(l.id));
+        if (!labelsBelong(input.labelIds, own)) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Label does not belong to this project" });
+        }
+      }
+
       const { id, ...updates } = input;
-      const saved = await fpb.updateTask(id, updates);
-      await fpb.logActivity(projectId, ctx.user.id, "updated task", saved?.title as string);
+      const saved = await fpb.updateTask(id, updates, ctx.user.id);
+      const wasCompleted = Boolean((before.task as any).completed);
+      const nowCompleted = Boolean(saved?.completed);
+      await fpb.logActivity(
+        projectId,
+        ctx.user.id,
+        !wasCompleted && nowCompleted
+          ? "completed task"
+          : wasCompleted && !nowCompleted
+            ? "reopened task"
+            : describeTaskEdit(updates),
+        saved?.title as string,
+        id
+      );
+
+      if (input.description !== undefined) {
+        await notifyMentions({
+          before: (before.task as any).description,
+          after: input.description,
+          project,
+          projectId,
+          taskId: id,
+          taskTitle: String(saved?.title ?? ""),
+          actor: ctx.user,
+          where: "description",
+        });
+      }
 
       // Only on a genuine change of hands, not on every save.
       const previous = (before.task as any).assignedTo;
@@ -519,6 +747,18 @@ export const fpbRouter = router({
           title: "Task assigned to you",
           message: `You have been assigned "${saved?.title}" in ${(project as any).title}.`,
           projectId,
+          taskId: id,
+        });
+      }
+
+      // Whoever asked for the work hears that it is done.
+      if (!wasCompleted && nowCompleted) {
+        await notify([String((before.task as any).createdBy ?? "")], ctx.user.id, {
+          title: "Task completed",
+          message: `${ctx.user.name ?? "Someone"} completed "${saved?.title}" in ${(project as any).title}.`,
+          projectId,
+          taskId: id,
+          type: "task_completed",
         });
       }
       return saved;
@@ -534,12 +774,35 @@ export const fpbRouter = router({
       return { success: true };
     }),
 
+  /**
+   * The people on a card (Trello "members"), besides its one assignee. Only
+   * people on the project can be put on its cards; the newly added hear about it.
+   */
   updateTaskMembers: protectedProcedure
-    .input(z.object({ taskId: objectId, memberIds: z.array(objectId) }))
+    .input(z.object({ taskId: objectId, memberIds: z.array(objectId).max(50) }))
     .mutation(async ({ ctx, input }) => {
-      const projectId = await projectIdForTask(input.taskId);
-      await requireProjectAccess(ctx, projectId);
+      const found = await fpb.getTask(input.taskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const projectId = String((found.task as any).projectId);
+      const project = await requireProjectAccess(ctx, projectId);
+
+      const people = new Set(projectPeople(project));
+      const outsiders = input.memberIds.filter(id => !people.has(id));
+      if (outsiders.length > 0) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Only people on this project can be added to its cards" });
+      }
+
+      const before = new Set(found.memberIds);
       const saved = await fpb.setTaskMembers(input.taskId, input.memberIds);
+      const added = saved.filter(id => !before.has(id));
+      await fpb.logActivity(projectId, ctx.user.id, "changed the card members", (found.task as any).title, input.taskId);
+      await notify(added, ctx.user.id, {
+        title: "Added to a card",
+        message: `${ctx.user.name ?? "Someone"} added you to "${(found.task as any).title}" in ${(project as any).title}.`,
+        projectId,
+        taskId: input.taskId,
+        type: "task_assigned",
+      });
       return { memberIds: saved };
     }),
 
@@ -550,7 +813,9 @@ export const fpbRouter = router({
     .mutation(async ({ ctx, input }) => {
       const projectId = await projectIdForTask(input.taskId);
       await requireProjectAccess(ctx, projectId);
-      return fpb.createSubtask(input.taskId, input.title);
+      const created = await fpb.createSubtask(input.taskId, input.title);
+      await fpb.logActivity(projectId, ctx.user.id, "added checklist item", input.title, input.taskId);
+      return created;
     }),
 
   getSubtask: protectedProcedure
@@ -581,7 +846,17 @@ export const fpbRouter = router({
       const projectId = await projectIdForTask(String((found.subtask as any).taskId));
       await requireProjectAccess(ctx, projectId);
       const { id, ...updates } = input;
-      return fpb.updateSubtask(id, updates);
+      const saved = await fpb.updateSubtask(id, updates);
+      if (input.completed !== undefined && input.completed !== Boolean((found.subtask as any).completed)) {
+        await fpb.logActivity(
+          projectId,
+          ctx.user.id,
+          input.completed ? "completed checklist item" : "reopened checklist item",
+          String((found.subtask as any).title ?? ""),
+          String((found.subtask as any).taskId)
+        );
+      }
+      return saved;
     }),
 
   deleteSubtask: protectedProcedure
@@ -598,25 +873,97 @@ export const fpbRouter = router({
   // ==================== Comments ====================
 
   addTaskComment: protectedProcedure
-    .input(z.object({ taskId: objectId, comment: z.string().min(1).max(5000) }))
+    .input(z.object({ taskId: objectId, comment: z.string().trim().min(1).max(5000) }))
     .mutation(async ({ ctx, input }) => {
-      const projectId = await projectIdForTask(input.taskId);
-      await requireProjectAccess(ctx, projectId);
-      return fpb.addTaskComment(input.taskId, ctx.user.id, input.comment);
+      const found = await fpb.getTask(input.taskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const projectId = String((found.task as any).projectId);
+      const project = await requireProjectAccess(ctx, projectId);
+      const created = await fpb.addTaskComment(input.taskId, ctx.user.id, input.comment);
+      await fpb.logActivity(projectId, ctx.user.id, "commented on", (found.task as any).title, input.taskId);
+
+      // The people on the card hear about the conversation on it.
+      const task = found.task as any;
+      await notify(
+        taskAudience(
+          { assignedTo: task.assignedTo, createdBy: task.createdBy, memberIds: found.memberIds },
+          ctx.user.id
+        ),
+        ctx.user.id,
+        {
+          title: `New comment on "${task.title}"`,
+          message: `${ctx.user.name ?? "Someone"} in ${(project as any).title}: ${excerpt(plainText(input.comment))}`,
+          projectId,
+          taskId: input.taskId,
+          type: "task_comment",
+        }
+      );
+      await notifyMentions({
+        after: input.comment,
+        project,
+        projectId,
+        taskId: input.taskId,
+        taskTitle: String(task.title ?? ""),
+        actor: ctx.user,
+        where: "comment",
+      });
+      return created;
     }),
 
+  /** Edit your own comment. The earlier text is kept and the comment is marked edited. */
+  editTaskComment: protectedProcedure
+    .input(z.object({ id: objectId, comment: z.string().trim().min(1).max(5000) }))
+    .mutation(async ({ ctx, input }) => {
+      const existing = await fpb.getTaskComment(input.id);
+      if (!existing) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
+      const task = await fpb.getTask(String(existing.taskId));
+      if (!task) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const projectId = String((task.task as any).projectId);
+      const project = await requireProjectAccess(ctx, projectId);
+      if (existing.deletedAt) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "A deleted comment cannot be edited" });
+      }
+      const saved = await fpb.editTaskComment(input.id, ctx.user.id, input.comment);
+      if (!saved) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "You can only edit your own comment" });
+      }
+      await fpb.logActivity(projectId, ctx.user.id, "edited a comment", undefined, String(existing.taskId));
+      // Someone newly @mentioned in the edit hears about it; the rest do not again.
+      await notifyMentions({
+        before: String(existing.comment ?? ""),
+        after: input.comment,
+        project,
+        projectId,
+        taskId: String(existing.taskId),
+        taskTitle: String((task.task as any).title ?? ""),
+        actor: ctx.user,
+        where: "comment",
+      });
+      return presentComment(saved as unknown as CommentRecord, isOrgWide(ctx.user.role));
+    }),
+
+  /**
+   * Delete a comment: your own, or anyone's if you are org-wide. The thread
+   * keeps "X deleted this comment" so nothing disappears without a trace.
+   */
   deleteTaskComment: protectedProcedure
     .input(z.object({ id: objectId }))
     .mutation(async ({ ctx, input }) => {
-      const removed = await fpb.deleteTaskComment(input.id, ctx.user.id);
-      if (!removed) {
+      const existing = await fpb.getTaskComment(input.id);
+      if (!existing) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
+      const projectId = await projectIdForTask(String(existing.taskId));
+      await requireProjectAccess(ctx, projectId);
+      const actor = { id: ctx.user.id, isOrgWide: isOrgWide(ctx.user.role) };
+      if (!canDeleteComment({ userId: String(existing.userId) }, actor)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
       }
+      await fpb.deleteTaskComment(input.id, ctx.user.id);
+      await fpb.logActivity(projectId, ctx.user.id, "deleted a comment", undefined, String(existing.taskId));
       return { success: true };
     }),
 
   addSubtaskComment: protectedProcedure
-    .input(z.object({ subtaskId: objectId, comment: z.string().min(1).max(5000) }))
+    .input(z.object({ subtaskId: objectId, comment: z.string().trim().min(1).max(5000) }))
     .mutation(async ({ ctx, input }) => {
       const found = await fpb.getSubtask(input.subtaskId);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
@@ -628,10 +975,17 @@ export const fpbRouter = router({
   deleteSubtaskComment: protectedProcedure
     .input(z.object({ id: objectId }))
     .mutation(async ({ ctx, input }) => {
-      const removed = await fpb.deleteSubtaskComment(input.id, ctx.user.id);
-      if (!removed) {
+      const existing = await fpb.getSubtaskComment(input.id);
+      if (!existing) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
+      const found = await fpb.getSubtask(String(existing.subtaskId));
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
+      const projectId = await projectIdForTask(String((found.subtask as any).taskId));
+      await requireProjectAccess(ctx, projectId);
+      const actor = { id: ctx.user.id, isOrgWide: isOrgWide(ctx.user.role) };
+      if (!canDeleteComment({ userId: String(existing.userId) }, actor)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
       }
+      await fpb.deleteSubtaskComment(input.id, ctx.user.id);
       return { success: true };
     }),
 
@@ -656,9 +1010,6 @@ export const fpbRouter = router({
     .mutation(async ({ ctx, input }) => {
       await requireProjectAccess(ctx, input.projectId);
 
-      if (!input.mimeType.startsWith("image/")) {
-        throw new TRPCError({ code: "BAD_REQUEST", message: "Only images can be annotated" });
-      }
       const buffer = Buffer.from(input.fileBase64, "base64");
       if (buffer.length === 0) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "File is empty" });
@@ -667,9 +1018,16 @@ export const fpbRouter = router({
         throw new TRPCError({ code: "BAD_REQUEST", message: "File must be 8MB or smaller" });
       }
 
-      // The extension is derived from the mime type rather than the supplied
-      // filename, so a client cannot land a .html file under /uploads.
-      const ext = input.mimeType.split("/")[1]?.replace(/[^a-z0-9]/gi, "") || "img";
+      // Only real PNG/JPEG/GIF/WebP files, checked by their bytes. The extension
+      // used to come from the client's MIME type, so "image/html" stored a .html
+      // page on the portal's own origin (stored XSS).
+      const ext = safeImageExtension(input.mimeType, buffer);
+      if (!ext) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Only PNG, JPEG, GIF or WebP images can be annotated",
+        });
+      }
       const key = `fpb-annotations/${input.projectId}/${Date.now()}.${ext}`;
       const { url } = await storagePut(key, buffer, input.mimeType);
 

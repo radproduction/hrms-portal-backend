@@ -230,6 +230,8 @@ function startOfWeekLocal(now = new Date()) {
 function sumHours(entries: any[], now = new Date()) {
   let total = 0;
   for (const e of entries ?? []) {
+    // A session nobody clocked out of has no real hours.
+    if (e?.autoClockedOut) continue;
     if (typeof e?.totalHours === "number") total += e.totalHours;
     else if (e?.status === "active" && e?.timeIn) {
       total += (now.getTime() - new Date(e.timeIn).getTime()) / 3_600_000;

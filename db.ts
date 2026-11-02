@@ -1198,6 +1198,7 @@ export async function createNotification(notification: {
   priority?: "low" | "medium" | "high";
   relatedId?: string;
   relatedType?: string;
+  link?: string;
 }) {
   await requireDb();
   await Notification.create({
@@ -1786,7 +1787,8 @@ export async function getAverageHoursByDay(days = 5) {
   entries.forEach((entry: any) => {
     const key = new Date(entry.timeIn).toISOString().slice(0, 10);
     const bucket = dayMap.get(key);
-    if (!bucket) return;
+    // A missed clock-out has no real hours; leave it out of the average.
+    if (!bucket || entry.autoClockedOut) return;
     const hours = entry.totalHours
       ? Number(entry.totalHours)
       : entry.timeOut

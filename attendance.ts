@@ -195,6 +195,11 @@ function entryHours(
   entry: RawTimeEntry,
   maxShiftHours = MAX_SHIFT_HOURS
 ): { hours: number; incomplete: boolean } {
+  // Never clocked out: the sweep's closing time is not a finishing time, so
+  // the session counts as a missing clock-out (below) with no hours, even on
+  // older rows where the sweep still wrote 12 hours.
+  if (entry.autoClockedOut) return { hours: 0, incomplete: false };
+
   let raw: number | null = null;
 
   if (typeof entry.totalHours === "number" && Number.isFinite(entry.totalHours)) {
@@ -301,8 +306,9 @@ export function summarizeEmployeeMonth(input: {
     const first = dayEntries
       .slice()
       .sort((a, b) => new Date(a.timeIn).getTime() - new Date(b.timeIn).getTime())[0];
+    // A clock-out the person never made is not shown as one.
     const lastOut = dayEntries
-      .filter(e => e.timeOut)
+      .filter(e => e.timeOut && !e.autoClockedOut)
       .sort(
         (a, b) => new Date(b.timeOut as string).getTime() - new Date(a.timeOut as string).getTime()
       )[0];

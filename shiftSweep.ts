@@ -46,7 +46,14 @@ export type OpenSession = {
 
 export type SweepDecision = {
   id: string;
+  /** Only closes the session; it is not when the person stopped working. */
   timeOut: Date;
+  /**
+   * Always 0. The real finishing time is unknown, so no hours are credited:
+   * crediting the limit (12h) used to put a made-up 12-hour day, with 4 hours of
+   * "overtime", on everyone who forgot to clock out. The person fixes the day
+   * with an attendance correction request, which records the real hours.
+   */
   totalHours: number;
 };
 
@@ -75,7 +82,7 @@ export function decideSweep(
     return [{
       id: session.id,
       timeOut: new Date(timeIn.getTime() + limitMs),
-      totalHours: maxHours,
+      totalHours: 0,
     }];
   });
 }
@@ -102,9 +109,11 @@ export async function sweepStaleSessions(now: Date = new Date()): Promise<number
     decisions.map(d => ({
       updateOne: {
         filter: { _id: d.id, status: "active" },
+        // timeIn is never touched: when they clocked in is real and stays as is.
         update: {
           timeOut: d.timeOut,
           totalHours: d.totalHours,
+          autoClockedOutAt: now,
           // Never "early_out": the session ran past a full day, and the flag
           // below already says the number is not a measurement.
           status: "completed",

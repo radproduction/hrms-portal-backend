@@ -96,6 +96,8 @@ export interface ITimeEntry extends Document {
    * needing a human to confirm.
    */
   autoClockedOut?: boolean;
+  /** When the sweep closed it. timeOut on these rows is not a real clock-out. */
+  autoClockedOutAt?: Date;
   notes?: string;
   location?: {
     lat: number;
@@ -116,6 +118,7 @@ const timeEntrySchema = new Schema<ITimeEntry>({
   totalHours: Number,
   status: { type: String, enum: ['active', 'completed', 'early_out'], default: 'active', required: true },
   autoClockedOut: { type: Boolean, default: false },
+  autoClockedOutAt: Date,
   notes: String,
   location: {
     lat: Number,
@@ -455,16 +458,39 @@ const projectTaskSchema = new Schema<IProjectTask>({
 export const ProjectTask = model<IProjectTask>('ProjectTask', projectTaskSchema);
 
 // ==================== Notification Model ====================
+export const NOTIFICATION_TYPES = [
+  'project_assigned',
+  'attendance_issue',
+  'hours_shortfall',
+  'leave_approved',
+  'leave_rejected',
+  'announcement',
+  'payslip_issued',
+  'task_assigned',
+  'system_alert',
+  // Project board
+  'project_member_added',
+  'task_comment',
+  'task_completed',
+  'task_mention',
+  'task_due_soon',
+  'task_overdue',
+] as const;
+
+export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
+
 export interface INotification extends Document {
   _id: Types.ObjectId;
   userId: Types.ObjectId;
-  type: 'project_assigned' | 'attendance_issue' | 'hours_shortfall' | 'leave_approved' | 'leave_rejected' | 'announcement' | 'payslip_issued' | 'task_assigned' | 'system_alert';
+  type: NotificationType;
   title: string;
   message: string;
   priority: 'low' | 'medium' | 'high';
   isRead: boolean;
   relatedId?: Types.ObjectId;
   relatedType?: string;
+  /** In-app path the notification opens, e.g. /board?project=..&task=.. */
+  link?: string;
   createdAt: Date;
 }
 
@@ -472,7 +498,7 @@ const notificationSchema = new Schema<INotification>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   type: { 
     type: String, 
-    enum: ['project_assigned', 'attendance_issue', 'hours_shortfall', 'leave_approved', 'leave_rejected', 'announcement', 'payslip_issued', 'task_assigned', 'system_alert'],
+    enum: NOTIFICATION_TYPES,
     required: true
   },
   title: { type: String, required: true },
@@ -481,6 +507,7 @@ const notificationSchema = new Schema<INotification>({
   isRead: { type: Boolean, default: false },
   relatedId: Schema.Types.ObjectId,
   relatedType: String,
+  link: String,
   createdAt: { type: Date, default: Date.now },
 });
 

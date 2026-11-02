@@ -280,7 +280,11 @@ export function buildFourWeeks(input: {
 
     if (open || unusable) {
       const reason = open ? "No clock-out" : unusable;
-      days.push({ date: key, kind: "fix", hours: null, timeIn: firstClock, timeOut: null, note: reason });
+      // The clock-in is real and shown; only the missing clock-out needs fixing.
+      days.push({
+        date: key, kind: "fix", hours: null, timeIn: firstClock, timeOut: null,
+        note: `In ${firstClock} · ${reason}`,
+      });
       toFix.push({ date: key, reason });
       continue;
     }
