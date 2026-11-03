@@ -361,7 +361,7 @@ describeWithDb("Flow Project Board", () => {
     expect(adminSees).toEqual(expect.arrayContaining(["Mine", "Theirs"]));
   });
 
-  it("lets a department head see and open their employees' boards", async () => {
+  it("lets a department head pick an employee and open their boards", async () => {
     // outsiderId heads a department that memberId belongs to.
     const team = await Department.create({ name: `FPB Grant team ${Date.now()}`, headUserId: outsiderId });
     await User.findByIdAndUpdate(memberId, { departmentId: team._id });
@@ -369,11 +369,15 @@ describeWithDb("Flow Project Board", () => {
       const theirs = (await newProject("Employee's work", [memberId])).project;
       const unrelated = (await newProject("Someone else's")).project;
 
-      const listed = await asHead(outsiderId).fpb.getProjects();
-      const seen = listed.find((p: any) => p.id === theirs.id) as any;
-      expect(seen).toBeTruthy();
-      expect(seen.viaTeam).toBe(true);
-      expect(listed.map((p: any) => p.id)).not.toContain(unrelated.id);
+      // Their own list is unchanged: team projects come only through the picker.
+      const own = await asHead(outsiderId).fpb.getProjects();
+      expect(own.map((p: any) => p.id)).not.toContain(theirs.id);
+
+      const people = await asHead(outsiderId).fpb.getTeamMembers();
+      expect(people.map((u: any) => u.id)).toEqual([memberId]);
+
+      const listed = await asHead(outsiderId).fpb.getProjects({ employeeId: memberId });
+      expect(listed.map((p: any) => p.id)).toEqual([theirs.id]);
 
       const board = await asHead(outsiderId).fpb.getBoard({ projectId: theirs.id });
       expect(board.columns.length).toBeGreaterThan(0);
@@ -381,16 +385,17 @@ describeWithDb("Flow Project Board", () => {
         asHead(outsiderId).fpb.getBoard({ projectId: unrelated.id })
       ).rejects.toThrow(/not on this project/);
 
-      // The same person without the head role gets nothing extra.
+      // Not someone outside their departments, and not without the head role.
+      await expect(
+        asHead(outsiderId).fpb.getProjects({ employeeId: adminId })
+      ).rejects.toThrow(/not in your department/);
+      await expect(
+        asOutsider().fpb.getProjects({ employeeId: memberId })
+      ).rejects.toThrow(/not in your department/);
+      expect(await asOutsider().fpb.getTeamMembers()).toEqual([]);
       await expect(
         asOutsider().fpb.getBoard({ projectId: theirs.id })
       ).rejects.toThrow(/not on this project/);
-      const asUser = await asOutsider().fpb.getProjects();
-      expect(asUser.map((p: any) => p.id)).not.toContain(theirs.id);
-
-      // The employee's own list is unchanged and not marked as a team view.
-      const own = (await asMember().fpb.getProjects()).find((p: any) => p.id === theirs.id) as any;
-      expect(own.viaTeam).toBe(false);
     } finally {
       await User.findByIdAndUpdate(memberId, { $unset: { departmentId: 1 } });
     }

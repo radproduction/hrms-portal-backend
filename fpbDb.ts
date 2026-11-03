@@ -405,34 +405,19 @@ export async function getProjects(filters?: {
   projectType?: string;
   status?: string;
   visibleTo?: string;
-  /**
-   * A department head's employees: projects any of them created or is on
-   * show up too, marked `viaTeam` when the viewer is not on them personally.
-   */
-  teamIds?: string[];
 }) {
   await requireDb();
   const query: Record<string, unknown> = {};
   if (filters?.projectType) query.projectType = filters.projectType;
   if (filters?.status) query.status = filters.status;
 
-  let ownIds: Set<string> | null = null;
-  let viewerId: string | null = null;
   if (filters?.visibleTo) {
     const viewer = toObjectId(filters.visibleTo);
-    viewerId = String(viewer);
     const memberships = await FpbProjectMember.find({ userId: viewer }, { projectId: 1 }).lean();
-    ownIds = new Set(memberships.map(m => String(m.projectId)));
-    const or: Record<string, unknown>[] = [
+    query.$or = [
       { createdBy: viewer },
       { _id: { $in: memberships.map(m => m.projectId) } },
     ];
-    const team = (filters.teamIds ?? []).filter(isValidId).map(toObjectId);
-    if (team.length > 0) {
-      const teamMemberships = await FpbProjectMember.find({ userId: { $in: team } }, { projectId: 1 }).lean();
-      or.push({ createdBy: { $in: team } }, { _id: { $in: teamMemberships.map(m => m.projectId) } });
-    }
-    query.$or = or;
   }
 
   const projects = await FpbProject.find(query).sort({ createdAt: -1 }).lean();
@@ -470,8 +455,6 @@ export async function getProjects(filters?: {
     return {
       ...normalize(p)!,
       memberIds,
-      // Visible only because the viewer heads someone on it.
-      viaTeam: ownIds !== null && String(p.createdBy) !== viewerId && !ownIds.has(key),
       memberCount: memberIds.length,
       taskCount: stat.total,
       completedTasks: stat.done,

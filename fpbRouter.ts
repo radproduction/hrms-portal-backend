@@ -71,6 +71,16 @@ export async function requireProjectAccess(
   throw new TRPCError({ code: "FORBIDDEN", message: "You are not on this project" });
 }
 
+/** Admins may look at anyone's boards, department heads at their own employees'. */
+async function requireCanViewEmployee(
+  ctx: { user: { id: string; role?: string } },
+  employeeId: string
+) {
+  if (isOrgWide(ctx.user.role)) return;
+  if (isAnyHead(ctx.user.role) && (await teamOf(ctx.user.id)).includes(employeeId)) return;
+  throw new TRPCError({ code: "FORBIDDEN", message: "That person is not in your department" });
+}
+
 /** Everyone in the departments this person heads (not including the head). */
 async function teamOf(userId: string): Promise<string[]> {
   const led = await departmentsLedBy(userId);
@@ -439,16 +449,38 @@ export const fpbRouter = router({
         .object({
           projectType: PROJECT_TYPE.optional(),
           status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
+          /** Show this employee's projects instead of the viewer's own. */
+          employeeId: objectId.optional(),
         })
         .optional()
     )
     .query(async ({ ctx, input }) => {
+      const { employeeId, ...filters } = input ?? {};
+      // Looking at one employee's projects: admins for anyone, department
+      // heads for the people in the departments they lead.
+      if (employeeId && employeeId !== ctx.user.id) {
+        await requireCanViewEmployee(ctx, employeeId);
+        return fpb.getProjects({ ...filters, visibleTo: employeeId });
+      }
       // Admins see every space; everyone else sees their own and the ones
-      // they were added to, and department heads also their employees' ones.
-      if (isOrgWide(ctx.user.role)) return fpb.getProjects({ ...input });
-      const teamIds = isAnyHead(ctx.user.role) ? await teamOf(ctx.user.id) : [];
-      return fpb.getProjects({ ...input, visibleTo: ctx.user.id, teamIds });
+      // they were added to.
+      return fpb.getProjects({
+        ...filters,
+        visibleTo: isOrgWide(ctx.user.role) && !employeeId ? undefined : ctx.user.id,
+      });
     }),
+
+  /**
+   * The people whose boards this person may look at: everyone for admins,
+   * their departments' employees for heads, nobody for anyone else.
+   */
+  getTeamMembers: protectedProcedure.query(async ({ ctx }) => {
+    if (!isAnyHead(ctx.user.role)) return [];
+    const everyone = await fpb.getBoardUsers();
+    if (isOrgWide(ctx.user.role)) return everyone.filter(u => u.id !== ctx.user.id);
+    const team = new Set(await teamOf(ctx.user.id));
+    return everyone.filter(u => team.has(u.id));
+  }),
 
   getProject: protectedProcedure
     .input(z.object({ id: objectId }))
