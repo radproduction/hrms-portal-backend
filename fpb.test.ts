@@ -361,6 +361,41 @@ describeWithDb("Flow Project Board", () => {
     expect(adminSees).toEqual(expect.arrayContaining(["Mine", "Theirs"]));
   });
 
+  it("lets a department head see and open their employees' boards", async () => {
+    // outsiderId heads a department that memberId belongs to.
+    const team = await Department.create({ name: `FPB Grant team ${Date.now()}`, headUserId: outsiderId });
+    await User.findByIdAndUpdate(memberId, { departmentId: team._id });
+    try {
+      const theirs = (await newProject("Employee's work", [memberId])).project;
+      const unrelated = (await newProject("Someone else's")).project;
+
+      const listed = await asHead(outsiderId).fpb.getProjects();
+      const seen = listed.find((p: any) => p.id === theirs.id) as any;
+      expect(seen).toBeTruthy();
+      expect(seen.viaTeam).toBe(true);
+      expect(listed.map((p: any) => p.id)).not.toContain(unrelated.id);
+
+      const board = await asHead(outsiderId).fpb.getBoard({ projectId: theirs.id });
+      expect(board.columns.length).toBeGreaterThan(0);
+      await expect(
+        asHead(outsiderId).fpb.getBoard({ projectId: unrelated.id })
+      ).rejects.toThrow(/not on this project/);
+
+      // The same person without the head role gets nothing extra.
+      await expect(
+        asOutsider().fpb.getBoard({ projectId: theirs.id })
+      ).rejects.toThrow(/not on this project/);
+      const asUser = await asOutsider().fpb.getProjects();
+      expect(asUser.map((p: any) => p.id)).not.toContain(theirs.id);
+
+      // The employee's own list is unchanged and not marked as a team view.
+      const own = (await asMember().fpb.getProjects()).find((p: any) => p.id === theirs.id) as any;
+      expect(own.viaTeam).toBe(false);
+    } finally {
+      await User.findByIdAndUpdate(memberId, { $unset: { departmentId: 1 } });
+    }
+  });
+
   it("lets only the space's owner or an admin delete it", async () => {
     await grantProjectRights(memberId);
     const space = await asHead(memberId).fpb.createProject({
