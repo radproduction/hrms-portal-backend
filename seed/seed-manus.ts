@@ -23,9 +23,6 @@ import {
   OvertimeEntry,
   Payslip,
   PerformanceRecord,
-  Project,
-  ProjectAssignment,
-  ProjectTask,
   Qualification,
   TimeEntry,
   User,
@@ -68,16 +65,11 @@ async function purgeNonAdminData() {
   const meetingIds = (await Meeting.find({ organizerId: { $in: employeeIds } }).select("_id").lean()).map(
     meeting => meeting._id
   );
-  const projectIds = (await Project.find({ createdBy: { $in: employeeIds } }).select("_id").lean()).map(
-    project => project._id
-  );
 
   await BreakLog.deleteMany({
     $or: [{ userId: { $in: employeeIds } }, { timeEntryId: { $in: timeEntryIds } }],
   });
-  await OvertimeEntry.deleteMany({
-    $or: [{ userId: { $in: employeeIds } }, { projectId: { $in: projectIds } }],
-  });
+  await OvertimeEntry.deleteMany({ userId: { $in: employeeIds } });
   await WorkSession.deleteMany({ userId: { $in: employeeIds } });
   await TimeEntry.deleteMany({ userId: { $in: employeeIds } });
   await LeaveApplication.deleteMany({
@@ -115,17 +107,6 @@ async function purgeNonAdminData() {
     $or: [{ userId: { $in: employeeIds } }, { meetingId: { $in: meetingIds } }],
   });
   await Meeting.deleteMany({ organizerId: { $in: employeeIds } });
-  await ProjectTask.deleteMany({
-    $or: [
-      { userId: { $in: employeeIds } },
-      { assigneeIds: { $in: employeeIds } },
-      { projectId: { $in: projectIds } },
-    ],
-  });
-  await ProjectAssignment.deleteMany({
-    $or: [{ userId: { $in: employeeIds } }, { projectId: { $in: projectIds } }],
-  });
-  await Project.deleteMany({ createdBy: { $in: employeeIds } });
   await User.deleteMany({ _id: { $in: employeeIds } });
 }
 

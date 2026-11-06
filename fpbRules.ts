@@ -216,3 +216,110 @@ export function labelsBelong(requested: string[], projectLabelIds: string[]): bo
   const own = new Set(projectLabelIds);
   return requested.every(id => own.has(id));
 }
+
+// ==================== Departments and stages ====================
+
+/**
+ * The stages a task moves through. A task has one status shared by every
+ * department working on it; the department board's columns are these stages,
+ * and the project board's columns map onto them by name.
+ */
+export const TASK_STAGES = ["backlog", "todo", "in_progress", "in_review", "done"] as const;
+export type TaskStage = (typeof TASK_STAGES)[number];
+
+/**
+ * Which stage a project board column stands for, read from its name, or null
+ * when the name says nothing about progress (e.g. "Marketing").
+ */
+export function inferStage(columnName: string): TaskStage | null {
+  const name = columnName.trim().toLowerCase().replace(/[\s_-]+/g, " ");
+  if (/^(backlog|ideas?|icebox|inbox|new)$/.test(name)) return "backlog";
+  if (/^(to ?do|todo|open|ready|planned|up next|next)$/.test(name)) return "todo";
+  if (/(progress|doing|working|active|wip|ongoing|development|dev)/.test(name)) return "in_progress";
+  if (/(review|qa|testing|test|approval|feedback|check)/.test(name)) return "in_review";
+  if (/^(done|complete|completed|finished|closed|shipped|delivered|live)$/.test(name)) return "done";
+  return null;
+}
+
+/**
+ * The column of a project's board a stage lands in: the first column whose
+ * name maps to that stage, else null (the card stays where it is).
+ */
+export function columnForStage(
+  columns: { id: string; name: string; position: number }[],
+  stage: TaskStage
+): string | null {
+  const sorted = [...columns].sort((a, b) => a.position - b.position);
+  return sorted.find(c => inferStage(c.name) === stage)?.id ?? null;
+}
+
+/**
+ * Who may mark a department task done. The task has one owner department;
+ * its head has the final say, along with the project's creator (the PM) and
+ * admins. Tasks with no departments keep the old rule: anyone on the project.
+ */
+export function canFinishTask(input: {
+  actorId: string;
+  actorIsOrgWide: boolean;
+  projectCreatorId: string;
+  departmentIds: string[];
+  ownerDepartmentHeadId: string | null;
+}): boolean {
+  if (input.actorIsOrgWide) return true;
+  if (input.departmentIds.length === 0) return true;
+  if (input.actorId === input.projectCreatorId) return true;
+  return input.ownerDepartmentHeadId !== null && input.actorId === input.ownerDepartmentHeadId;
+}
+
+/**
+ * The owner department of a task: the one named, if it is among the task's
+ * departments, else the first department. Null for a task with none.
+ */
+export function resolveOwnerDepartment(departmentIds: string[], requested?: string | null): string | null {
+  const unique = [...new Set(departmentIds)];
+  if (unique.length === 0) return null;
+  if (requested && unique.includes(requested)) return requested;
+  return unique[0];
+}
+
+export type StageSpan = { status: string; from: string; to: string | null; durationMs: number };
+
+/**
+ * A task's history as stages: when it entered each one and how long it stayed,
+ * from its status-change events. The last span is still open (to = null) and
+ * runs to `now`. Totals add up the time spent in each stage across visits.
+ */
+export function buildStageTimeline(input: {
+  createdAt: Date | string;
+  initialStatus: string;
+  events: { at: Date | string; toStatus: string }[];
+  now: Date;
+}): { spans: StageSpan[]; totals: Record<string, number> } {
+  const events = [...input.events]
+    .map(e => ({ at: new Date(e.at).getTime(), toStatus: e.toStatus }))
+    .sort((a, b) => a.at - b.at);
+  const spans: StageSpan[] = [];
+  let status = input.initialStatus;
+  let since = new Date(input.createdAt).getTime();
+  for (const e of events) {
+    if (e.toStatus === status) continue;
+    const at = Math.max(e.at, since);
+    spans.push({ status, from: new Date(since).toISOString(), to: new Date(at).toISOString(), durationMs: at - since });
+    status = e.toStatus;
+    since = at;
+  }
+  const end = Math.max(input.now.getTime(), since);
+  spans.push({ status, from: new Date(since).toISOString(), to: null, durationMs: end - since });
+  const totals: Record<string, number> = {};
+  for (const s of spans) totals[s.status] = (totals[s.status] ?? 0) + s.durationMs;
+  return { spans, totals };
+}
+
+
+/** Midnight at the start of `now`'s day in office time (offset in minutes east of UTC). */
+export function officeDayStart(now: Date, offsetMinutes: number): Date {
+  const shift = offsetMinutes * 60000;
+  const local = new Date(now.getTime() + shift);
+  local.setUTCHours(0, 0, 0, 0);
+  return new Date(local.getTime() - shift);
+}

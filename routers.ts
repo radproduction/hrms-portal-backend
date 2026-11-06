@@ -26,60 +26,11 @@ import { requestsRouter, timeRouter, wingmanRouter } from "./nowRouter";
 import { leadsRouter } from "./leads";
 import { clientRoundsRouter } from "./clientRounds";
 
-/**
- * Tells each assignee of a legacy project task that it was assigned to them -
- * in the app and, best-effort, on WhatsApp through Wingman.
- *
- * The two task-creation procedures both went through db.createProjectTask,
- * which validates, de-duplicates and (with no assignees) falls back to the
- * creator, so the people actually notified are read off the stored task rather
- * than off the raw input. The person who created the task is never notified of
- * their own action. A failed notification never rolls back the task.
- */
-async function notifyTaskAssignees(
-  task: { id?: string; title?: unknown; assigneeIds?: unknown; completionDate?: unknown },
-  actorId: string
-) {
-  const assigneeIds = Array.isArray(task.assigneeIds) ? (task.assigneeIds as string[]) : [];
-  const title = typeof task.title === "string" ? task.title : "a task";
-  const due =
-    task.completionDate instanceof Date
-      ? task.completionDate.toISOString()
-      : typeof task.completionDate === "string"
-        ? task.completionDate
-        : undefined;
-
-  for (const userId of [...new Set(assigneeIds)]) {
-    if (!userId || userId === actorId) continue;
-    try {
-      await db.createNotification({
-        userId,
-        type: "task_assigned",
-        title: "New task assigned",
-        message: `You've been assigned: ${title}`,
-        priority: "medium",
-        relatedId: task.id,
-        relatedType: "task",
-      });
-      emitNotification({ userId });
-      void notifyWingmanEvent(userId, {
-        type: "task_assigned",
-        title: "New task assigned",
-        message: `You've been assigned: ${title}`,
-        taskTitle: title,
-        due,
-      });
-    } catch (error) {
-      console.error("[Tasks] failed to notify assignee", userId, error);
-    }
-  }
-}
-
 export const appRouter = router({
   system: systemRouter,
 
-  // Flow Project Board (Kanban). Separate from the legacy `projects` router
-  // below, which still backs the dashboard, reports and the clock-out flow.
+  // The project board: projects, tasks, departments and their boards. The old
+  // separate project system was removed in Nov 2026; everything runs here.
   fpb: fpbRouter,
 
   // Now workspace screens: attendance corrections and support tickets, the
@@ -620,10 +571,6 @@ export const appRouter = router({
         return await db.getTimeEntriesByDateRange(ctx.user.id, input.startDate, input.endDate);
       }),
 
-    // Get completed tasks for today
-    getCompletedTasksForToday: protectedProcedure.query(async ({ ctx }) => {
-      return await db.getCompletedTasksForUserByDate(ctx.user.id, new Date());
-    }),
   }),
 
   leaves: router({
@@ -829,121 +776,6 @@ export const appRouter = router({
     // Get all users for chat
     getUsers: protectedProcedure.query(async () => {
       return await db.getAllUsers();
-    }),
-  }),
-
-  projects: router({
-    // Get user's projects
-    getMyProjects: protectedProcedure.query(async ({ ctx }) => {
-      return await db.getUserProjects(ctx.user.id);
-    }),
-
-    // Get user's tasks across projects
-    getMyTasks: protectedProcedure.query(async ({ ctx }) => {
-      return await db.getTasksByEmployee(ctx.user.id);
-    }),
-
-    // Get project tasks
-    getTasks: protectedProcedure
-      .input(z.object({
-        projectId: z.string(),
-      }))
-      .query(async ({ input, ctx }) => {
-        return await db.getProjectTasks(input.projectId, ctx.user.id);
-      }),
-
-    // Create custom project (employee-created)
-    createCustomProject: protectedProcedure
-      .input(z.object({
-        name: z.string(),
-        description: z.string().optional(),
-        priority: z.enum(["low", "medium", "high"]).optional(),
-        employeeIds: z.array(z.string()).optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        const projectId = await db.createProject({
-          name: input.name,
-          description: input.description,
-          priority: input.priority || "medium",
-          status: "active",
-          source: "employee",
-          createdBy: ctx.user.id,
-        });
-
-        const uniqueEmployeeIds = new Set<string>([
-          ctx.user.id,
-          ...(input.employeeIds || []),
-        ]);
-
-        for (const userId of uniqueEmployeeIds) {
-          await db.assignUserToProject(projectId, userId);
-        }
-
-        return { success: true, projectId };
-      }),
-
-    // Create task
-    createTask: protectedProcedure
-      .input(z.object({
-        projectId: z.string(),
-        title: z.string(),
-        description: z.string().optional(),
-        priority: z.enum(["low", "medium", "high"]).optional(),
-        status: z.enum(["todo", "in_progress", "completed", "blocked"]).optional(),
-        timeEntryId: z.string().optional(),
-        assigneeIds: z.array(z.string()).optional(),
-        completionDate: z.date().optional(),
-      }))
-      .mutation(async ({ input, ctx }) => {
-        const created = await db.createProjectTask({
-          projectId: input.projectId,
-          userId: ctx.user.id,
-          title: input.title,
-          description: input.description,
-          priority: input.priority || "medium",
-          status: input.status || "todo",
-          completedAt: input.status === "completed" ? new Date() : undefined,
-          timeEntryId: input.timeEntryId,
-          assigneeIds: input.assigneeIds,
-          completionDate: input.completionDate,
-        });
-
-        // Tell whoever the task was assigned to; previously nothing did.
-        await notifyTaskAssignees(created as any, ctx.user.id);
-
-        return { success: true, task: created };
-      }),
-
-    // Update task
-    updateTask: protectedProcedure
-      .input(z.object({
-        taskId: z.string(),
-        status: z.enum(["todo", "in_progress", "completed", "blocked"]).optional(),
-        title: z.string().optional(),
-        description: z.string().optional(),
-        priority: z.enum(["low", "medium", "high"]).optional(),
-        completionDate: z.date().optional(),
-      }))
-      .mutation(async ({ input }) => {
-        const { taskId, ...updates } = input;
-        
-        const updateData: any = { ...updates };
-        if (updates.status === "completed") {
-          updateData.completedAt = new Date();
-        }
-
-        await db.updateProjectTask(taskId, updateData);
-        return { success: true };
-      }),
-
-    // Get project stats
-    getStats: protectedProcedure.query(async ({ ctx }) => {
-      return await db.getProjectStats(ctx.user.id);
-    }),
-
-    // Get task completion stats for current user
-    getMyTaskStats: protectedProcedure.query(async ({ ctx }) => {
-      return await db.getTaskStatsForUser(ctx.user.id);
     }),
   }),
 
@@ -1261,193 +1093,6 @@ export const appRouter = router({
         await db.updateFormSubmissionStatus(input.id, input.status, ctx.user.id, input.response);
         return { success: true };
       }),
-
-    getProjectsOverview: protectedProcedure.query(async ({ ctx }) => {
-      if (!isOrgWide(ctx.user.role)) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-      }
-      return await db.getProjectsWithAssignments();
-    }),
-
-    getProjectTasks: protectedProcedure
-      .input(z.object({ projectId: z.string() }))
-      .query(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        return await db.getAllProjectTasks(input.projectId);
-      }),
-
-    createTaskForProject: protectedProcedure
-      .input(
-        z.object({
-          projectId: z.string(),
-          title: z.string().min(1),
-          description: z.string().optional(),
-          priority: z.enum(["low", "medium", "high"]).optional(),
-          status: z.enum(["todo", "in_progress", "completed", "blocked"]).optional(),
-          assigneeIds: z.array(z.string()).min(1, "Select at least one assignee"),
-          completionDate: z.date().optional(),
-        })
-      )
-      .mutation(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        const created = await db.createProjectTask({
-          projectId: input.projectId,
-          userId: ctx.user.id,
-          title: input.title,
-          description: input.description,
-          priority: input.priority || "medium",
-          status: input.status || "todo",
-          completedAt: input.status === "completed" ? new Date() : undefined,
-          assigneeIds: input.assigneeIds,
-          completionDate: input.completionDate,
-        });
-
-        // The whole point of Phase 1: the assignee learns they have a task.
-        await notifyTaskAssignees(created as any, ctx.user.id);
-
-        return { success: true, task: created };
-      }),
-
-    updateTaskForProject: protectedProcedure
-      .input(
-        z.object({
-          taskId: z.string(),
-          title: z.string().optional(),
-          description: z.string().optional(),
-          priority: z.enum(["low", "medium", "high"]).optional(),
-          status: z.enum(["todo", "in_progress", "completed", "blocked"]).optional(),
-          assigneeIds: z.array(z.string()).optional(),
-          completionDate: z.date().optional(),
-        })
-      )
-      .mutation(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        const { taskId, ...updates } = input;
-        const updateData: any = { ...updates };
-        if (updates.status === "completed") {
-          updateData.completedAt = new Date();
-        }
-        await db.updateProjectTask(taskId, updateData);
-        return { success: true };
-      }),
-
-    getEmployeeProjects: protectedProcedure
-      .input(z.object({ employeeId: z.string() }))
-      .query(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        return await db.getProjectsForEmployee(input.employeeId);
-      }),
-
-    getEmployeeTasks: protectedProcedure
-      .input(z.object({ employeeId: z.string() }))
-      .query(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        return await db.getTasksByEmployee(input.employeeId);
-      }),
-
-    getResourcePerformance: protectedProcedure.query(async ({ ctx }) => {
-      if (!isOrgWide(ctx.user.role)) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-      }
-      return await db.getResourcePerformance();
-    }),
-
-    deleteProject: protectedProcedure
-      .input(z.object({ id: z.string() }))
-      .mutation(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        await db.deleteProject(input.id);
-        return { success: true };
-      }),
-
-    deleteTask: protectedProcedure
-      .input(z.object({ id: z.string() }))
-      .mutation(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        await db.deleteProjectTask(input.id);
-        return { success: true };
-      }),
-
-    getTasksByDate: protectedProcedure
-      .input(z.object({ date: z.date() }))
-      .query(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        const start = new Date(input.date);
-        start.setHours(0, 0, 0, 0);
-        const end = new Date(input.date);
-        end.setHours(23, 59, 59, 999);
-        return await db.getTasksCreatedByDate(start, end);
-      }),
-
-    assignProject: protectedProcedure
-      .input(
-        z.object({
-          name: z.string().min(1),
-          description: z.string().optional(),
-          priority: z.enum(["low", "medium", "high"]).default("medium"),
-          employeeIds: z.array(z.string()).min(1),
-          startDate: z.date().optional(),
-          endDate: z.date().optional(),
-        })
-      )
-      .mutation(async ({ input, ctx }) => {
-        if (!isOrgWide(ctx.user.role)) {
-          throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-        }
-        const projectId = await db.createProject({
-          name: input.name,
-          description: input.description,
-          priority: input.priority,
-          status: "active",
-          source: "team_lead",
-          createdBy: ctx.user.id,
-          startDate: input.startDate,
-          endDate: input.endDate,
-        });
-        for (const userId of input.employeeIds) {
-          await db.assignUserToProject(projectId, userId);
-          await db.createNotification({
-            userId,
-            type: "project_assigned",
-            title: "New project assigned",
-            message: `You have been assigned to ${input.name}.`,
-            priority: "medium",
-            relatedId: projectId,
-            relatedType: "project",
-          });
-          emitNotification({ userId });
-          void notifyWingmanEvent(userId, {
-            type: "project_assigned",
-            title: "New project assigned",
-            message: `You have been assigned to ${input.name}.`,
-            projectName: input.name,
-          });
-        }
-        return { success: true, projectId };
-      }),
-
-    getOngoingTasks: protectedProcedure.query(async ({ ctx }) => {
-      if (!isOrgWide(ctx.user.role)) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-      }
-      return await db.getOngoingTasksWithAssignments();
-    }),
 
     getEmployeeStatusSnapshot: protectedProcedure.query(async ({ ctx }) => {
       if (!isOrgWide(ctx.user.role)) {
@@ -1885,28 +1530,32 @@ export const appRouter = router({
       }),
 
     /**
-     * Lets a department's head open projects on the board.
+     * Lets one person open projects on the board: the project manager.
      *
-     * Super admin only. This is the grant the client asked for: the board
-     * should reflect who actually runs things, rather than filling up with a
-     * space per person.
+     * Admin only. Projects are opened by the people the admin names, not by
+     * every department head; heads receive tasks for their departments.
      */
-    setDepartmentProjectRights: protectedProcedure
-      .input(z.object({ departmentId: z.string().min(1), allowed: z.boolean() }))
+    setUserProjectRights: protectedProcedure
+      .input(z.object({ userId: z.string().regex(/^[0-9a-fA-F]{24}$/), allowed: z.boolean() }))
       .mutation(async ({ ctx, input }) => {
         if (!isSuperAdmin(ctx.user.role)) {
           throw new TRPCError({
             code: "FORBIDDEN",
-            message: "Only a super admin can grant project rights",
+            message: "Only an admin can grant project rights",
           });
         }
-        const saved = await departments.setDepartmentProjectRights(
-          input.departmentId,
-          input.allowed
-        );
-        if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Department not found" });
+        const saved = await departments.setUserProjectRights(input.userId, input.allowed);
+        if (!saved) throw new TRPCError({ code: "NOT_FOUND", message: "Employee not found" });
         return saved;
       }),
+
+    /** Who may open projects (besides admins and heads of operations). */
+    getProjectCreators: protectedProcedure.query(async ({ ctx }) => {
+      if (!isOrgWide(ctx.user.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+      }
+      return departments.listProjectCreators();
+    }),
 
     /** Which roles the caller is allowed to hand out, for the role picker. */
     getAssignableRoles: protectedProcedure.query(async ({ ctx }) => {
@@ -1948,14 +1597,6 @@ export const appRouter = router({
         throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
       }
       return await db.getAnnouncementsWithReadCounts();
-    }),
-
-    // Task completion stats (all tasks)
-    getTaskStats: protectedProcedure.query(async ({ ctx }) => {
-      if (!isOrgWide(ctx.user.role)) {
-        throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
-      }
-      return await db.getTaskStatsForAll();
     }),
 
     createAnnouncement: protectedProcedure

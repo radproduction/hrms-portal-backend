@@ -98,13 +98,17 @@ describeWithDb("Flow Project Board", () => {
       { name: `FPB Grant ${userId}`, headUserId: userId, canCreateProjects: true },
       { upsert: true, returnDocument: "after" }
     ).lean();
-    await User.findByIdAndUpdate(userId, { role: "dept_head", departmentId: department!._id });
+    await User.findByIdAndUpdate(userId, {
+      role: "dept_head",
+      departmentId: department!._id,
+      canCreateProjects: true,
+    });
   }
 
   /** Creates a project and returns it together with its seeded columns. */
   async function newProject(title = "Project", memberIds: string[] = []) {
     const project = await asAdmin().fpb.createProject({
-      title, projectType: "dev", memberIds,
+      title, scopes: ["website"], memberIds,
     });
     const board = await asAdmin().fpb.getBoard({ projectId: project.id });
     return { project, columns: board.columns };
@@ -138,7 +142,7 @@ describeWithDb("Flow Project Board", () => {
   it("accepts a custom set of columns at creation", async () => {
     const project = await asAdmin().fpb.createProject({
       title: "Marketing push",
-      projectType: "management",
+      scopes: ["social_media", "design"],
       columns: [
         { name: "Marketing", color: "#ec4899" },
         { name: "Design", color: "#8b5cf6" },
@@ -323,7 +327,7 @@ describeWithDb("Flow Project Board", () => {
 
     const space = await asHead(memberId).fpb.createProject({
       title: "Member's own space",
-      projectType: "dev",
+      scopes: ["website"],
       memberIds: [outsiderId],
     });
 
@@ -341,8 +345,8 @@ describeWithDb("Flow Project Board", () => {
   it("shows a space only to the people in it", async () => {
     await grantProjectRights(memberId);
     await grantProjectRights(outsiderId);
-    const mine = await asHead(memberId).fpb.createProject({ title: "Mine", projectType: "dev" });
-    const theirs = await asHead(outsiderId).fpb.createProject({ title: "Theirs", projectType: "dev" });
+    const mine = await asHead(memberId).fpb.createProject({ title: "Mine", scopes: ["website"] });
+    const theirs = await asHead(outsiderId).fpb.createProject({ title: "Theirs", scopes: ["website"] });
 
     const memberSees = (await asMember().fpb.getProjects()).map((p: any) => p.title);
     expect(memberSees).toContain("Mine");
@@ -404,7 +408,7 @@ describeWithDb("Flow Project Board", () => {
   it("lets only the space's owner or an admin delete it", async () => {
     await grantProjectRights(memberId);
     const space = await asHead(memberId).fpb.createProject({
-      title: "Owned", projectType: "dev", memberIds: [outsiderId],
+      title: "Owned", scopes: ["website"], memberIds: [outsiderId],
     });
 
     // Being invited into a space is not licence to destroy it.
@@ -418,7 +422,7 @@ describeWithDb("Flow Project Board", () => {
 
   it("gates column edits on the column's own project", async () => {
     await grantProjectRights(outsiderId);
-    const theirs = await asHead(outsiderId).fpb.createProject({ title: "Theirs", projectType: "dev" });
+    const theirs = await asHead(outsiderId).fpb.createProject({ title: "Theirs", scopes: ["website"] });
     const board = await asOutsider().fpb.getBoard({ projectId: theirs.id });
     const columnId = (board.columns[0] as any).id;
 
@@ -840,7 +844,122 @@ describeWithDb("Flow Project Board", () => {
       .map((a: any) => a.action);
     expect(actions).toContain("created project");
     expect(actions).toContain("added task");
-    expect(actions).toContain("moved task");
+    // Backlog to To Do is a stage change, recorded with its from/to.
+    expect(actions).toContain("changed the status");
+  });
+
+  // ------------------------------------------------------------ departments
+
+  it("runs a task through departments: PM hands it over, heads assign, owner head finishes", async () => {
+    const stamp = Date.now();
+    const [pm, designHead, devHead, designer, developer] = await User.create([
+      { openId: `d-pm-${stamp}`, name: "PM Ali", role: "user", employeeId: `DPM${stamp}`, canCreateProjects: true },
+      { openId: `d-dh-${stamp}`, name: "Design Head", role: "dept_head", employeeId: `DDH${stamp}` },
+      { openId: `d-vh-${stamp}`, name: "Dev Head", role: "dept_head", employeeId: `DVH${stamp}` },
+      { openId: `d-de-${stamp}`, name: "Designer", role: "user", employeeId: `DDE${stamp}` },
+      { openId: `d-dv-${stamp}`, name: "Developer", role: "user", employeeId: `DDV${stamp}` },
+    ]);
+    const [design, dev] = await Department.create([
+      { name: `FPB Grant Design ${stamp}`, headUserId: designHead._id },
+      { name: `FPB Grant Dev ${stamp}`, headUserId: devHead._id },
+    ]);
+    await User.findByIdAndUpdate(designer._id, { departmentId: design._id });
+    await User.findByIdAndUpdate(developer._id, { departmentId: dev._id });
+    const ids = {
+      pm: String(pm._id), designHead: String(designHead._id), devHead: String(devHead._id),
+      designer: String(designer._id), developer: String(developer._id),
+      design: String(design._id), dev: String(dev._id),
+    };
+    const as = (id: string, role = "user") => appRouter.createCaller(ctxFor(id, role));
+    try {
+      const project = await as(ids.pm).fpb.createProject({ title: "Website", scopes: ["website", "design"] });
+
+      // The PM cannot hand it straight to an employee.
+      await expect(
+        as(ids.pm).fpb.createTask({
+          projectId: project.id, title: "x", departmentIds: [ids.design], assignedTo: ids.designer,
+        })
+      ).rejects.toThrow(/heads choose/);
+
+      const task = await as(ids.pm).fpb.createTask({
+        projectId: project.id,
+        title: "Homepage",
+        departmentIds: [ids.design, ids.dev],
+        ownerDepartmentId: ids.design,
+      });
+      const stored = await FpbTask.findById(task.id).lean();
+      expect(stored!.status).toBe("backlog");
+      expect(String(stored!.ownerDepartmentId)).toBe(ids.design);
+
+      // Both heads are on the card and the project, and were told.
+      const full = await as(ids.designHead, "dept_head").fpb.getTask({ id: task.id });
+      expect(full.memberIds).toEqual(expect.arrayContaining([ids.designHead, ids.devHead]));
+      expect(await Notification.countDocuments({ userId: designHead._id })).toBeGreaterThan(0);
+
+      // It sits in each department's backlog.
+      const board = await as(ids.devHead, "dept_head").fpb.getDepartmentBoard({ departmentId: ids.dev });
+      expect(board.tasks.map((t: any) => t.id)).toContain(task.id);
+      expect(board.canAssign).toBe(true);
+
+      // A head assigns only within their own department.
+      await expect(
+        as(ids.devHead, "dept_head").fpb.assignForDepartment({ taskId: task.id, departmentId: ids.design, userId: ids.designer })
+      ).rejects.toThrow(/department's head/);
+      await expect(
+        as(ids.designHead, "dept_head").fpb.assignForDepartment({ taskId: task.id, departmentId: ids.design, userId: ids.developer })
+      ).rejects.toThrow(/not in this department/);
+      await as(ids.designHead, "dept_head").fpb.assignForDepartment({ taskId: task.id, departmentId: ids.design, userId: ids.designer });
+      await as(ids.devHead, "dept_head").fpb.assignForDepartment({ taskId: task.id, departmentId: ids.dev, userId: ids.developer });
+      const assigned = await FpbTask.findById(task.id).lean();
+      // The owner department's assignee is the task's assignee.
+      expect(String(assigned!.assignedTo)).toBe(ids.designer);
+      expect(assigned!.assignees).toHaveLength(2);
+
+      // The PM cannot reassign it directly either.
+      await expect(
+        as(ids.pm).fpb.updateTask({ id: task.id, assignedTo: ids.developer })
+      ).rejects.toThrow(/department heads assign/);
+
+      // One status for everyone: the designer moves it, the project card follows.
+      await as(ids.designer).fpb.setTaskStage({ taskId: task.id, status: "in_progress" });
+      const moving = await FpbTask.findById(task.id).lean();
+      expect(moving!.status).toBe("in_progress");
+      const cols = await asAdmin().fpb.getBoard({ projectId: project.id });
+      const inProgress = (cols.columns as any[]).find(c => c.name === "In Progress");
+      expect(String(moving!.columnId)).toBe(inProgress.id);
+
+      // Only the owner department's head (or the PM / an admin) finishes it.
+      await expect(
+        as(ids.devHead, "dept_head").fpb.setTaskStage({ taskId: task.id, status: "done" })
+      ).rejects.toThrow(/owner department's head/);
+      await expect(
+        as(ids.designer).fpb.updateTask({ id: task.id, completed: true })
+      ).rejects.toThrow(/owner department's head/);
+      await as(ids.designHead, "dept_head").fpb.setTaskStage({ taskId: task.id, status: "done" });
+      const done = await FpbTask.findById(task.id).lean();
+      expect(done!.completed).toBe(true);
+      expect(String(done!.completedBy)).toBe(ids.designer);
+
+      // The history is there whether or not the timeline is shown.
+      const tracking = await as(ids.pm).fpb.getTaskTracking({ taskId: task.id });
+      expect(tracking.spans.map((s: any) => s.status)).toEqual(["backlog", "in_progress", "done"]);
+
+      // The owner's KPIs and the department's activity log see it.
+      const kpis = await asAdmin().fpb.getDepartmentKpis({
+        month: new Date().getMonth() + 1,
+        year: new Date().getFullYear(),
+      });
+      const designKpi = kpis.find((k: any) => k.id === ids.design)!;
+      expect(designKpi.totalTasks).toBe(1);
+      expect(designKpi.ownedTasks).toBe(1);
+      const log = await asAdmin().fpb.getDepartmentActivity({ departmentId: ids.dev, limit: 50 });
+      expect(log.map((a: any) => a.action)).toContain("changed the status");
+      await expect(as(ids.developer).fpb.getDepartmentKpis({ month: 1, year: 2026 })).rejects.toThrow(/Only admins/);
+    } finally {
+      await User.deleteMany({ _id: { $in: [pm._id, designHead._id, devHead._id, designer._id, developer._id] } });
+      await Department.deleteMany({ _id: { $in: [design._id, dev._id] } });
+      await Notification.deleteMany({ userId: { $in: [designHead._id, devHead._id, designer._id, developer._id, pm._id] } });
+    }
   });
 
   it("rejects a malformed id rather than throwing a cast error", async () => {

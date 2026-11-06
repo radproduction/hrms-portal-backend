@@ -8,8 +8,8 @@ import { canOpenProjects, setDepartmentHead, setUserDepartment } from "./departm
 import { describeWithDb } from "./test-utils";
 
 /**
- * Opening a project used to be open to everyone. It is now a grant a super
- * admin gives to a department head.
+ * Opening a project is a grant an admin gives to a person by name (the
+ * project manager); department heads and employees do not have it.
  *
  *   TEST_MONGODB_URI="mongodb://.../hrms_test" npx vitest run projectRights.test.ts
  */
@@ -60,88 +60,63 @@ describeWithDb("Project creation rights", () => {
 
   beforeEach(async () => {
     await FpbProject.deleteMany({ createdBy: { $in: [adminId, hooId, headId, memberId] } });
-    await Department.findByIdAndUpdate(deptId, { canCreateProjects: false });
+    await User.updateMany({ _id: { $in: [headId, memberId] } }, { canCreateProjects: false });
+    await Department.findByIdAndUpdate(deptId, { canCreateProjects: true });
   });
 
   const makeProject = (id: string, role: string) =>
-    caller(id, role).fpb.createProject({ title: `P${stamp}`, projectType: "dev" });
+    caller(id, role).fpb.createProject({ title: `P${stamp}`, scopes: ["website"] });
 
   it("refuses an ordinary employee", async () => {
-    await expect(makeProject(memberId, "user")).rejects.toThrow(/do not have permission/i);
+    await expect(makeProject(memberId, "user")).rejects.toThrow(/only the project manager/i);
   });
 
-  it("refuses a head whose department has not been granted it", async () => {
-    // Leading a team is not on its own a licence to open projects.
-    await expect(makeProject(headId, "dept_head")).rejects.toThrow(/do not have permission/i);
+  it("refuses a department head, even one whose department had the old grant", async () => {
+    // Heads receive tasks for their departments; opening projects is the
+    // project manager's job.
+    await expect(makeProject(headId, "dept_head")).rejects.toThrow(/only the project manager/i);
   });
 
-  it("lets that same head through once a super admin grants it", async () => {
-    await caller(adminId, "admin").admin.setDepartmentProjectRights({
-      departmentId: deptId,
-      allowed: true,
-    });
-
-    const project = await makeProject(headId, "dept_head");
+  it("lets a person through once an admin grants it to them by name", async () => {
+    await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: true });
+    const project = await makeProject(memberId, "user");
     expect(project.title).toBe(`P${stamp}`);
+    // The grant is to that person, not their department or their head.
+    await expect(makeProject(headId, "dept_head")).rejects.toThrow(/only the project manager/i);
   });
 
   it("takes the right away again when the grant is withdrawn", async () => {
-    await caller(adminId, "admin").admin.setDepartmentProjectRights({
-      departmentId: deptId,
-      allowed: true,
-    });
-    expect(await canOpenProjects({ id: headId, role: "dept_head" })).toBe(true);
-
-    await caller(adminId, "admin").admin.setDepartmentProjectRights({
-      departmentId: deptId,
-      allowed: false,
-    });
-    expect(await canOpenProjects({ id: headId, role: "dept_head" })).toBe(false);
+    await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: true });
+    expect(await canOpenProjects({ id: memberId, role: "user" })).toBe(true);
+    await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: false });
+    expect(await canOpenProjects({ id: memberId, role: "user" })).toBe(false);
   });
 
-  it("always lets org-wide roles through, grant or no grant", async () => {
+  it("always lets org-wide roles through", async () => {
     await expect(makeProject(adminId, "admin")).resolves.toBeTruthy();
     await expect(makeProject(hooId, "head_of_ops")).resolves.toBeTruthy();
   });
 
-  it("keeps the grant to a super admin", async () => {
-    // A head of operations reaches everything else, but handing out rights is
-    // how the hierarchy is set, and that stays one level up.
+  it("keeps the grant with the admin", async () => {
     await expect(
-      caller(hooId, "head_of_ops").admin.setDepartmentProjectRights({
-        departmentId: deptId,
-        allowed: true,
-      })
-    ).rejects.toThrow(/super admin/i);
-
+      caller(hooId, "head_of_ops").admin.setUserProjectRights({ userId: memberId, allowed: true })
+    ).rejects.toThrow(/only an admin/i);
     await expect(
-      caller(headId, "dept_head").admin.setDepartmentProjectRights({
-        departmentId: deptId,
-        allowed: true,
-      })
-    ).rejects.toThrow(/super admin/i);
+      caller(headId, "dept_head").admin.setUserProjectRights({ userId: memberId, allowed: true })
+    ).rejects.toThrow(/only an admin/i);
   });
 
   it("reports the same answer to the UI as the mutation enforces", async () => {
-    // The button is hidden using this; if the two disagreed, people would be
-    // offered something that then refuses them.
-    expect(await caller(headId, "dept_head").fpb.canCreateProjects()).toBe(false);
-
-    await caller(adminId, "admin").admin.setDepartmentProjectRights({
-      departmentId: deptId,
-      allowed: true,
-    });
-
-    expect(await caller(headId, "dept_head").fpb.canCreateProjects()).toBe(true);
     expect(await caller(memberId, "user").fpb.canCreateProjects()).toBe(false);
+    await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: true });
+    expect(await caller(memberId, "user").fpb.canCreateProjects()).toBe(true);
+    expect(await caller(headId, "dept_head").fpb.canCreateProjects()).toBe(false);
   });
 
-  it("grants the head, not everyone in the department", async () => {
-    await caller(adminId, "admin").admin.setDepartmentProjectRights({
-      departmentId: deptId,
-      allowed: true,
-    });
-
-    await expect(makeProject(memberId, "user")).rejects.toThrow(/do not have permission/i);
+  it("lists who holds the grant for the admin", async () => {
+    await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: true });
+    const list = await caller(adminId, "admin").admin.getProjectCreators();
+    expect(list.map((u: any) => u.id)).toContain(memberId);
+    await expect(caller(headId, "dept_head").admin.getProjectCreators()).rejects.toThrow(/admin access/i);
   });
 });

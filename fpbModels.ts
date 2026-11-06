@@ -5,18 +5,20 @@
  * primary keys. Here everything is Mongoose with ObjectIds, so every id that
  * crosses the API is a string.
  *
- * Deliberately namespaced (Fpb*) and kept apart from the legacy
- * Project/ProjectTask models, which remain in use by the dashboard, reports and
- * the clock-out flow.
+ * Namespaced (Fpb*) from when a separate, older project system existed. That
+ * system was removed in Nov 2026; these are the app's only projects and tasks.
  */
 import { Schema, model, Document, Types } from "mongoose";
 
 export type FpbProjectType = "dev" | "lead" | "management" | "accounting" | "other";
+/** What a project covers. A project can have several (e.g. website and design). */
+export const PROJECT_SCOPES = ["social_media", "design", "saas", "website"] as const;
+export type FpbProjectScope = (typeof PROJECT_SCOPES)[number];
 export type FpbPriority = "low" | "medium" | "high" | "urgent";
-export type FpbWorkStatus = "todo" | "in_progress" | "in_review" | "blocked" | "done";
+export type FpbWorkStatus = "backlog" | "todo" | "in_progress" | "in_review" | "blocked" | "done";
 
 const PRIORITIES: FpbPriority[] = ["low", "medium", "high", "urgent"];
-const WORK_STATUSES: FpbWorkStatus[] = ["todo", "in_progress", "in_review", "blocked", "done"];
+const WORK_STATUSES: FpbWorkStatus[] = ["backlog", "todo", "in_progress", "in_review", "blocked", "done"];
 
 // ==================== Column ====================
 // A project owns its own columns, the way a Jira board belongs to one space.
@@ -107,6 +109,9 @@ export interface IFpbProject extends Document {
   projectType: FpbProjectType;
   priority: FpbPriority;
   status: "active" | "on_hold" | "completed" | "archived";
+  /** What the project covers; one or more of PROJECT_SCOPES. Replaces projectType. */
+  scopes: FpbProjectScope[];
+  startDate?: Date;
   dueDate?: Date;
   createdBy: Types.ObjectId;
   createdAt: Date;
@@ -117,6 +122,7 @@ const fpbProjectSchema = new Schema<IFpbProject>(
   {
     title: { type: String, required: true },
     description: String,
+    // Superseded by `scopes`; kept so older projects still load.
     projectType: {
       type: String,
       enum: ["dev", "lead", "management", "accounting", "other"],
@@ -129,6 +135,8 @@ const fpbProjectSchema = new Schema<IFpbProject>(
       enum: ["active", "on_hold", "completed", "archived"],
       default: "active",
     },
+    scopes: { type: [{ type: String, enum: PROJECT_SCOPES }], default: [] },
+    startDate: Date,
     dueDate: Date,
     createdBy: { type: Schema.Types.ObjectId, ref: "User", required: true },
   },
@@ -189,6 +197,17 @@ export interface IFpbTask extends Document {
   completedBy?: Types.ObjectId;
   /** Labels of this card's project (FpbLabel ids). */
   labelIds: Types.ObjectId[];
+  /**
+   * The departments working on this task. The project manager hands a task to
+   * departments, not to people; each department's head then assigns it.
+   */
+  departmentIds: Types.ObjectId[];
+  /** The one department whose head has the final say (and that it is reported under). */
+  ownerDepartmentId?: Types.ObjectId;
+  /** Who each department's head put on it. `assignedTo` mirrors the owner department's. */
+  assignees: { departmentId: Types.ObjectId; userId: Types.ObjectId }[];
+  /** Shows the card's tracking timeline. History is recorded either way. */
+  trackingEnabled: boolean;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -211,10 +230,25 @@ const fpbTaskSchema = new Schema<IFpbTask>(
     completedAt: Date,
     completedBy: { type: Schema.Types.ObjectId, ref: "User" },
     labelIds: { type: [{ type: Schema.Types.ObjectId, ref: "FpbLabel" }], default: [] },
+    departmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "Department" }], default: [] },
+    ownerDepartmentId: { type: Schema.Types.ObjectId, ref: "Department" },
+    assignees: {
+      type: [
+        {
+          _id: false,
+          departmentId: { type: Schema.Types.ObjectId, ref: "Department", required: true },
+          userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
+        },
+      ],
+      default: [],
+    },
+    trackingEnabled: { type: Boolean, default: false },
   },
   { timestamps: true }
 );
 fpbTaskSchema.index({ projectId: 1, columnId: 1, position: 1 });
+// A department's board: every task handed to it, across projects.
+fpbTaskSchema.index({ departmentIds: 1, status: 1 });
 // Monthly performance: tasks completed by a person within a date range.
 fpbTaskSchema.index({ completedBy: 1, completedAt: 1 });
 // The board sorts one sub-project's cards within each column.
@@ -446,6 +480,13 @@ export interface IFpbActivity extends Document {
   userId: Types.ObjectId;
   action: string;
   detail?: string;
+  /** The task's departments at the time, for each department's activity log. */
+  departmentIds?: Types.ObjectId[];
+  /** For moves and status changes: where the task was and where it went. */
+  fromStatus?: string;
+  toStatus?: string;
+  fromColumn?: string;
+  toColumn?: string;
   createdAt: Date;
 }
 
@@ -455,9 +496,15 @@ const fpbActivitySchema = new Schema<IFpbActivity>({
   userId: { type: Schema.Types.ObjectId, ref: "User", required: true },
   action: { type: String, required: true },
   detail: String,
+  departmentIds: { type: [{ type: Schema.Types.ObjectId, ref: "Department" }], default: undefined },
+  fromStatus: String,
+  toStatus: String,
+  fromColumn: String,
+  toColumn: String,
   createdAt: { type: Date, default: Date.now },
 });
 fpbActivitySchema.index({ projectId: 1, createdAt: -1 });
+fpbActivitySchema.index({ departmentIds: 1, createdAt: -1 }, { sparse: true });
 fpbActivitySchema.index({ taskId: 1, createdAt: -1 }, { sparse: true });
 
 export const FpbActivity = model<IFpbActivity>("FpbActivity", fpbActivitySchema);

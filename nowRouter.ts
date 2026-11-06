@@ -10,6 +10,7 @@
  * Mounted on the app router alongside the existing routers; nothing that was
  * there before is changed.
  */
+import * as fpbDb from "./fpbDb";
 import { TRPCError } from "@trpc/server";
 import { Types } from "mongoose";
 import { z } from "zod";
@@ -372,14 +373,14 @@ type TaskRow = { title: string; project: string; due: Date | null; overdue: bool
 
 async function loadTasks(userId: string, now: Date): Promise<TaskRow[]> {
   const todayKey = localDateKey(now);
-  const tasks = (await db.getTasksByEmployee(userId)) as any[];
+  const tasks = (await fpbDb.getPersonBoardTasks(userId)) as any[];
   return tasks.map(task => {
-    const due = task.completionDate ? new Date(task.completionDate) : null;
+    const due = task.dueDate ? new Date(task.dueDate) : null;
     const dueKey = due ? localDateKey(due) : null;
-    const done = task.status === "completed";
+    const done = Boolean(task.done);
     return {
       title: String(task.title ?? "Untitled task"),
-      project: String(task.project?.name ?? "No project"),
+      project: String(task.projectTitle ?? "No project"),
       due,
       overdue: !done && dueKey !== null && dueKey < todayKey,
       dueToday: !done && dueKey === todayKey,

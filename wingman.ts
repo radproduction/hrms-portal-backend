@@ -1,3 +1,4 @@
+import * as fpbDb from "./fpbDb";
 import crypto from "node:crypto";
 import { z } from "zod";
 import * as db from "./db";
@@ -275,24 +276,24 @@ export async function handleWingmanEmployeeData(
     db.getActiveTimeEntry(user.id),
     db.getTimeEntriesByDateRange(user.id, startOfTodayLocal(now), now),
     db.getTimeEntriesByDateRange(user.id, startOfWeekLocal(now), now),
-    db.getTasksByEmployee(user.id),
-    db.getUserProjects(user.id),
+    fpbDb.getPersonBoardTasks(user.id),
+    fpbDb.getProjects({ visibleTo: user.id }),
     db.getLeaveApplicationsByUser(user.id),
   ]);
 
   const openTasks = (tasksRaw as any[])
-    .filter(t => t && t.status !== "completed")
+    .filter(t => t && !t.done)
     .map(t => ({
       title: t.title ?? "",
       status: t.status ?? "todo",
       priority: t.priority ?? "medium",
-      due: t.completionDate ? new Date(t.completionDate).toISOString() : null,
-      project: t.project?.name ?? null,
+      due: t.dueDate ? new Date(t.dueDate).toISOString() : null,
+      project: t.projectTitle ?? null,
     }));
 
   const projects = (projectsRaw as any[])
     .filter(p => p && p.status !== "completed" && p.status !== "archived")
-    .map(p => ({ name: p.name ?? "", status: p.status ?? "active", priority: p.priority ?? "medium" }));
+    .map(p => ({ name: p.title ?? "", status: p.status ?? "active", priority: p.priority ?? "medium" }));
 
   const leaves = (leavesRaw as any[]) ?? [];
   const pendingLeaves = leaves.filter(l => l?.status === "pending");

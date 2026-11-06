@@ -20,15 +20,24 @@ import * as fpb from "./fpbDb";
 import * as db from "./db";
 import { isAnyHead, isOrgWide } from "./roles";
 import { canOpenProjects, departmentsLedBy, listDepartments } from "./departments";
-import { getMonthRange } from "./attendance";
+import { OFFSET_MINUTES, getMonthRange } from "./attendance";
 import { summarizePerformance } from "./fpbMetrics";
+import { summarizeDepartmentKpis, summarizeOverview } from "./fpbOverview";
 import { emitNotification } from "./_core/realtime";
+import { notifyWingmanEvent } from "./wingman";
 import { storagePut } from "./storage";
 import { deleteRoundsForProject } from "./clientRounds";
 import type { NotificationType } from "./models";
 import {
   boardLink,
+  buildStageTimeline,
   canDeleteComment,
+  canFinishTask,
+  columnForStage,
+  inferStage,
+  officeDayStart,
+  resolveOwnerDepartment,
+  type TaskStage,
   isLabelColor,
   labelsBelong,
   mentionTargets,
@@ -40,8 +49,9 @@ import {
 } from "./fpbRules";
 
 const PRIORITY = z.enum(["low", "medium", "high", "urgent"]);
-const WORK_STATUS = z.enum(["todo", "in_progress", "in_review", "blocked", "done"]);
+const WORK_STATUS = z.enum(["backlog", "todo", "in_progress", "in_review", "blocked", "done"]);
 const PROJECT_TYPE = z.enum(["dev", "lead", "management", "accounting", "other"]);
+const PROJECT_SCOPE = z.enum(["social_media", "design", "saas", "website"]);
 const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid id");
 
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
@@ -164,6 +174,15 @@ async function notify(
         link: boardLink(payload.projectId, payload.taskId),
       });
       emitNotification({ userId });
+      // Assignments also reach the person on WhatsApp through Wingman, as
+      // tasks did before the board replaced the old project system.
+      if ((payload.type ?? "task_assigned") === "task_assigned" && payload.taskId) {
+        void notifyWingmanEvent(userId, {
+          type: "task_assigned",
+          title: payload.title,
+          message: payload.message,
+        });
+      }
     } catch (error) {
       // A failed notification must not roll back the work it describes.
       console.error("[FPB] failed to notify", userId, error);
@@ -232,6 +251,133 @@ function describeTaskEdit(updates: Record<string, unknown>): string {
     .filter(k => updates[k] !== undefined && parts[k])
     .map(k => parts[k]);
   return said.length > 0 ? said.join(", ") : "updated the card";
+}
+
+// ==================== Department tasks ====================
+
+const NOT_FINISHER =
+  "Only the owner department's head, the project manager or an admin can mark this task done";
+
+/** Whether `ctx.user` may mark this task done (see canFinishTask). */
+async function mayFinish(ctx: { user: { id: string; role?: string } }, task: any, project: any) {
+  const departmentIds = ((task?.departmentIds ?? []) as unknown[]).map(String);
+  const owner = resolveOwnerDepartment(departmentIds, task?.ownerDepartmentId ? String(task.ownerDepartmentId) : null);
+  let ownerHead: string | null = null;
+  if (owner) {
+    const departments = await fpb.getDepartmentsWithHeads();
+    ownerHead = departments.find(d => d.id === owner)?.headUserId ?? null;
+  }
+  return canFinishTask({
+    actorId: ctx.user.id,
+    actorIsOrgWide: isOrgWide(ctx.user.role),
+    projectCreatorId: String(project?.createdBy ?? ""),
+    departmentIds,
+    ownerDepartmentHeadId: ownerHead,
+  });
+}
+
+/**
+ * The project manager's own controls (which departments a task goes to):
+ * admins, the project's creator, or anyone allowed to open projects who is on it.
+ */
+async function requireTaskManager(ctx: { user: { id: string; role?: string } }, projectId: string) {
+  const project = await requireProjectAccess(ctx, projectId);
+  if (isOrgWide(ctx.user.role)) return project;
+  if (String((project as any).createdBy) === ctx.user.id) return project;
+  if (await canOpenProjects(ctx.user)) return project;
+  throw new TRPCError({
+    code: "FORBIDDEN",
+    message: "Only the project manager can change which departments a task goes to",
+  });
+}
+
+/**
+ * A task's departments are open to their heads and people even when they are
+ * not on the project: the department board is where they find their work.
+ */
+async function departmentsOf(ctx: { user: { id: string; role?: string } }) {
+  const led = isAnyHead(ctx.user.role) ? await departmentsLedBy(ctx.user.id) : [];
+  const own = await fpb.getUserDepartmentId(ctx.user.id);
+  return { led, all: [...new Set([...led, ...(own ? [own] : [])])] };
+}
+
+/** Project access, or (for a department task) being in or heading one of its departments. */
+async function requireTaskAccess(ctx: { user: { id: string; role?: string } }, task: any) {
+  const projectId = String(task.projectId);
+  try {
+    return await requireProjectAccess(ctx, projectId);
+  } catch (error) {
+    const taskDepartments = ((task?.departmentIds ?? []) as unknown[]).map(String);
+    if (taskDepartments.length > 0) {
+      const mine = await departmentsOf(ctx);
+      if (taskDepartments.some(d => mine.all.includes(d))) {
+        const project = await fpb.getProject(projectId);
+        if (project) return project;
+      }
+    }
+    throw error;
+  }
+}
+
+/**
+ * Moves a task to a stage: one status for everyone working on it. The project
+ * board card follows to the first column of that stage, so the project
+ * manager's board and the departments' boards never disagree.
+ */
+async function applyStage(
+  ctx: { user: { id: string; role?: string; name?: string | null } },
+  task: any,
+  project: any,
+  stage: string
+) {
+  const id = String(task.id ?? task._id);
+  const projectId = String(task.projectId);
+  const fromStatus = task.completed ? "done" : String(task.status ?? "todo");
+  if (fromStatus === stage) return task;
+  if (stage === "done" && !(await mayFinish(ctx, task, project))) {
+    throw new TRPCError({ code: "FORBIDDEN", message: NOT_FINISHER });
+  }
+
+  const saved = await fpb.updateTask(id, { status: stage, completed: stage === "done" }, ctx.user.id);
+
+  const columns = ((await fpb.getColumns(projectId)) as any[]).map(c => ({
+    id: String(c.id),
+    name: String(c.name),
+    position: Number(c.position ?? 0),
+  }));
+  const fromColumn = columns.find(c => c.id === String(task.columnId));
+  const target = stage === "blocked" ? null : columnForStage(columns, stage as TaskStage);
+  let toColumn = fromColumn;
+  if (target && target !== String(task.columnId)) {
+    await fpb.moveTask(id, target, 100000);
+    toColumn = columns.find(c => c.id === target);
+  }
+
+  await fpb.logActivity(projectId, ctx.user.id, "changed the status", String(saved?.title ?? task.title), id, {
+    fromStatus,
+    toStatus: stage,
+    fromColumn: fromColumn?.name,
+    toColumn: toColumn?.name,
+  });
+
+  if (stage === "done") {
+    await notify([String(task.createdBy ?? "")], ctx.user.id, {
+      title: "Task completed",
+      message: `${ctx.user.name ?? "Someone"} completed "${saved?.title ?? task.title}" in ${(project as any).title}.`,
+      projectId,
+      taskId: id,
+      type: "task_completed",
+    });
+  }
+  return saved;
+}
+
+/** requireTaskAccess by task id; returns the task's project id. */
+async function requireTaskAccessById(ctx: { user: { id: string; role?: string } }, taskId: string) {
+  const found = await fpb.getTask(taskId);
+  if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+  await requireTaskAccess(ctx, found.task);
+  return String((found.task as any).projectId);
 }
 
 async function projectIdForTask(taskId: string) {
@@ -448,6 +594,7 @@ export const fpbRouter = router({
       z
         .object({
           projectType: PROJECT_TYPE.optional(),
+          scope: PROJECT_SCOPE.optional(),
           status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
           /** Show this employee's projects instead of the viewer's own. */
           employeeId: objectId.optional(),
@@ -500,8 +647,10 @@ export const fpbRouter = router({
       z.object({
         title: z.string().min(1).max(255),
         description: z.string().optional(),
-        projectType: PROJECT_TYPE,
+        projectType: PROJECT_TYPE.optional(),
+        scopes: z.array(PROJECT_SCOPE).min(1, "Pick at least one scope").max(4),
         priority: PRIORITY.optional(),
+        startDate: z.date().optional(),
         dueDate: z.date().optional(),
         memberIds: z.array(objectId).optional(),
         // Optional custom workflow; omitted means the default five columns.
@@ -512,15 +661,16 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      // Opening a project is a granted right, not something everyone has.
-      // Org-wide roles always; a department head only once a super admin has
-      // given their department the grant.
+      // Opening a project is a granted right: admins, and the people an admin
+      // has named (the project manager).
       if (!(await canOpenProjects(ctx.user))) {
         throw new TRPCError({
           code: "FORBIDDEN",
-          message:
-            "You do not have permission to create projects. Ask an administrator to grant it to your department.",
+          message: "Only the project manager can create projects. Ask an administrator for access.",
         });
+      }
+      if (input.startDate && input.dueDate && input.startDate > input.dueDate) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "The start date is after the due date" });
       }
 
       const project = await fpb.createProject({
@@ -528,7 +678,9 @@ export const fpbRouter = router({
         columns: input.columns,
         description: input.description,
         projectType: input.projectType,
+        scopes: [...new Set(input.scopes)],
         priority: input.priority,
+        startDate: input.startDate,
         dueDate: input.dueDate,
         createdBy: ctx.user.id,
         memberIds: input.memberIds,
@@ -551,15 +703,25 @@ export const fpbRouter = router({
         title: z.string().min(1).max(255).optional(),
         description: z.string().optional(),
         projectType: PROJECT_TYPE.optional(),
+        scopes: z.array(PROJECT_SCOPE).min(1, "Pick at least one scope").max(4).optional(),
         priority: PRIORITY.optional(),
         status: z.enum(["active", "on_hold", "completed", "archived"]).optional(),
+        startDate: z.date().nullable().optional(),
         dueDate: z.date().nullable().optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
-      await requireProjectAccess(ctx, input.id);
+      const current = await requireProjectAccess(ctx, input.id);
       const { id, ...updates } = input;
-      const saved = await fpb.updateProject(id, updates);
+      const start = updates.startDate !== undefined ? updates.startDate : (current as any).startDate;
+      const due = updates.dueDate !== undefined ? updates.dueDate : (current as any).dueDate;
+      if (start && due && new Date(start) > new Date(due)) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "The start date is after the due date" });
+      }
+      const saved = await fpb.updateProject(id, {
+        ...updates,
+        scopes: updates.scopes ? Array.from(new Set<string>(updates.scopes)) : undefined,
+      });
       await fpb.logActivity(id, ctx.user.id, "updated project");
       return saved;
     }),
@@ -586,12 +748,54 @@ export const fpbRouter = router({
       })
     )
     .mutation(async ({ ctx, input }) => {
-      const projectId = await projectIdForTask(input.id);
-      await requireProjectAccess(ctx, projectId);
+      const found = await fpb.getTask(input.id);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const task = found.task as any;
+      const projectId = String(task.projectId);
+      const project = await requireTaskAccess(ctx, task);
       try {
-        const moved = await fpb.moveTask(input.id, input.columnId, input.position);
+        // A column that stands for a stage (Backlog, In Progress, Done...)
+        // moves the task's one status with it; others just reposition it.
+        const columns = (await fpb.getColumns(projectId)) as any[];
+        const fromColumn = columns.find(c => String(c.id) === String(task.columnId));
+        const toColumn = columns.find(c => String(c.id) === input.columnId);
+        const fromStatus = task.completed ? "done" : String(task.status ?? "todo");
+        // Reordering within a column never changes the status, and a blocked
+        // task stays blocked when it sits in an in-progress column.
+        const changesColumn = Boolean(toColumn) && String(toColumn.id) !== String(task.columnId);
+        let stage = changesColumn ? inferStage(String(toColumn.name)) : null;
+        if (stage === "in_progress" && fromStatus === "blocked") stage = null;
+        if (stage === "done" && fromStatus !== "done" && !(await mayFinish(ctx, task, project))) {
+          throw new TRPCError({ code: "FORBIDDEN", message: NOT_FINISHER });
+        }
+
+        let moved = await fpb.moveTask(input.id, input.columnId, input.position);
         if (!moved) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
-        await fpb.logActivity(projectId, ctx.user.id, "moved task", moved.title as string, input.id);
+        const statusChanged = stage !== null && stage !== fromStatus;
+        if (statusChanged) {
+          moved = (await fpb.updateTask(input.id, { status: stage, completed: stage === "done" }, ctx.user.id)) ?? moved;
+        }
+        await fpb.logActivity(
+          projectId,
+          ctx.user.id,
+          statusChanged ? "changed the status" : "moved task",
+          moved.title as string,
+          input.id,
+          {
+            fromColumn: fromColumn?.name,
+            toColumn: toColumn?.name,
+            ...(statusChanged ? { fromStatus, toStatus: stage! } : {}),
+          }
+        );
+        if (statusChanged && stage === "done") {
+          await notify([String(task.createdBy ?? "")], ctx.user.id, {
+            title: "Task completed",
+            message: `${ctx.user.name ?? "Someone"} completed "${moved.title}" in ${(project as any).title}.`,
+            projectId,
+            taskId: input.id,
+            type: "task_completed",
+          });
+        }
         return moved;
       } catch (error) {
         if (error instanceof TRPCError) throw error;
@@ -649,7 +853,7 @@ export const fpbRouter = router({
     .query(async ({ ctx, input }) => {
       const found = await fpb.getTask(input.id);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
-      await requireProjectAccess(ctx, String((found.task as any).projectId));
+      await requireTaskAccess(ctx, found.task);
       // Deleted comments keep their place in the thread; their text (and the
       // history of edited ones) only reaches org-wide roles.
       const orgWide = isOrgWide(ctx.user.role);
@@ -675,12 +879,48 @@ export const fpbRouter = router({
         assignedTo: objectId.optional(),
         memberIds: z.array(objectId).max(50).optional(),
         labelIds: z.array(objectId).max(20).optional(),
+        /**
+         * The departments the task goes to. The project manager hands work to
+         * departments, never straight to an employee; each head assigns it.
+         */
+        departmentIds: z.array(objectId).max(10).optional(),
+        /** With more than one department: whose head has the final say. */
+        ownerDepartmentId: objectId.optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
       const project = await requireProjectAccess(ctx, input.projectId);
-      // Same rules as editing a card: project people only, project labels only.
-      const people = new Set(projectPeople(project));
+      const departmentIds = [...new Set(input.departmentIds ?? [])];
+      // Handing work to departments is the project manager's call.
+      if (departmentIds.length > 0) await requireTaskManager(ctx, input.projectId);
+      // Nobody but an admin puts someone else straight on a task: work reaches
+      // people through their department head.
+      if (input.assignedTo && input.assignedTo !== ctx.user.id && !isOrgWide(ctx.user.role)) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Give the task to departments; their heads choose who works on it",
+        });
+      }
+      let heads: string[] = [];
+      let departmentNames = new Map<string, string>();
+      if (departmentIds.length > 0) {
+        if (input.assignedTo) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Give the task to departments; their heads choose who works on it",
+          });
+        }
+        const all = await fpb.getDepartmentsWithHeads();
+        const chosen = all.filter(d => departmentIds.includes(d.id));
+        if (chosen.length !== departmentIds.length) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "Unknown department" });
+        }
+        heads = chosen.map(d => d.headUserId).filter((id): id is string => Boolean(id));
+        departmentNames = new Map(chosen.map(d => [d.id, d.name]));
+      }
+      // Same rules as editing a card: project people (and the departments'
+      // heads) only, project labels only.
+      const people = new Set([...projectPeople(project), ...heads]);
       if ([input.assignedTo, ...(input.memberIds ?? [])].some(id => id && !people.has(id))) {
         throw new TRPCError({ code: "BAD_REQUEST", message: "Only people on this project can be added to its cards" });
       }
@@ -711,8 +951,55 @@ export const fpbRouter = router({
           });
         }
       }
-      const task = await fpb.createTask({ ...input, createdBy: ctx.user.id });
-      await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title, task.id);
+      let columnId = input.columnId;
+      let ownerDepartmentId: string | null = null;
+      if (departmentIds.length > 0) {
+        ownerDepartmentId = resolveOwnerDepartment(departmentIds, input.ownerDepartmentId ?? null);
+        // A department task starts in the backlog, on both boards.
+        const columns = ((await fpb.getColumns(input.projectId)) as any[]).map(c => ({
+          id: String(c.id), name: String(c.name), position: Number(c.position ?? 0),
+        }));
+        columnId = columnForStage(columns, "backlog") ?? columnId;
+      }
+      // Otherwise the card's status is the stage of the column it lands in.
+      let initialStatus: string | undefined = departmentIds.length > 0 ? "backlog" : undefined;
+      if (!initialStatus) {
+        const columns = (await fpb.getColumns(input.projectId)) as any[];
+        const landing = columnId
+          ? columns.find(c => String(c.id) === columnId)
+          : [...columns].sort((a, b) => Number(a.position ?? 0) - Number(b.position ?? 0))[0];
+        initialStatus = (landing ? inferStage(String(landing.name)) : null) ?? "todo";
+        if (initialStatus === "done") initialStatus = "todo";
+      }
+      const task = await fpb.createTask({
+        ...input,
+        columnId,
+        departmentIds,
+        ownerDepartmentId,
+        status: initialStatus,
+        createdBy: ctx.user.id,
+      });
+      if (heads.length > 0) {
+        // The heads need the project open to work the task, and are on the card.
+        await fpb.addProjectMembers(input.projectId, heads);
+        await fpb.addTaskMembers(task.id, heads);
+      }
+      await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title, task.id, {
+        toStatus: initialStatus,
+      });
+      if (departmentIds.length > 0) {
+        const all = await fpb.getDepartmentsWithHeads();
+        for (const d of all.filter(x => departmentIds.includes(x.id) && x.headUserId)) {
+          await notify([d.headUserId!], ctx.user.id, {
+            title: `New task for ${d.name}`,
+            message: `"${input.title}" in ${(project as any).title} is in ${d.name}'s backlog. Assign it to someone in your team.`,
+            projectId: input.projectId,
+            taskId: task.id,
+            type: "task_assigned",
+          });
+        }
+        void departmentNames;
+      }
       if (input.description) {
         await notifyMentions({
           after: input.description,
@@ -751,15 +1038,39 @@ export const fpbRouter = router({
         dueDate: z.date().nullable().optional(),
         assignedTo: objectId.nullable().optional(),
         labelIds: z.array(objectId).max(20).optional(),
+        /** Shows the card's tracking timeline. History is recorded either way. */
+        trackingEnabled: z.boolean().optional(),
       })
     )
     .mutation(async ({ ctx, input }) => {
       const before = await fpb.getTask(input.id);
       if (!before) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
       const projectId = String((before.task as any).projectId);
-      const project = await requireProjectAccess(ctx, projectId);
+      const project = await requireTaskAccess(ctx, before.task);
+      const departmentTask = (((before.task as any).departmentIds ?? []) as unknown[]).length > 0;
 
-      // A card can only carry its own project's labels.
+      // On a department task the heads choose who works on it (admins too go
+      // through assignForDepartment, so each department's assignee stays right).
+      if (departmentTask && input.assignedTo !== undefined) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "This task belongs to departments: its department heads assign it",
+        });
+      }
+      // Elsewhere nobody but an admin puts someone else on it.
+      if (
+        input.assignedTo &&
+        input.assignedTo !== ctx.user.id &&
+        !isOrgWide(ctx.user.role)
+      ) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Give the task to departments; their heads choose who works on it",
+        });
+      }
+
+      // A card can only carry its own project's labels. Checked before any
+      // stage change, so a refused edit changes nothing.
       if (input.labelIds) {
         input.labelIds = [...new Set<string>(input.labelIds)];
         const own = ((await fpb.getLabels(projectId)) as any[]).map(l => String(l.id));
@@ -768,9 +1079,24 @@ export const fpbRouter = router({
         }
       }
 
+      // A stage change goes through applyStage: one status for everyone, the
+      // board column follows, and only the owner side may finish it.
+      const wasDone = Boolean((before.task as any).completed) || (before.task as any).status === "done";
+      let stage: string | undefined = input.status;
+      if (stage === undefined && input.completed === true && !wasDone) stage = "done";
+      if (stage === undefined && input.completed === false && wasDone) stage = "in_progress";
+      let staged: any = null;
+      if (stage !== undefined) {
+        staged = (await applyStage(ctx, before.task, project, stage)) ?? null;
+        input.status = undefined;
+        input.completed = undefined;
+      }
+
       const { id, ...updates } = input;
+      // Only a stage change: applyStage has saved, logged and notified it.
+      if (staged && Object.values(updates).every(v => v === undefined)) return staged;
       const saved = await fpb.updateTask(id, updates, ctx.user.id);
-      const wasCompleted = Boolean((before.task as any).completed);
+      const wasCompleted = staged ? Boolean(staged.completed) : Boolean((before.task as any).completed);
       const nowCompleted = Boolean(saved?.completed);
       await fpb.logActivity(
         projectId,
@@ -863,13 +1189,330 @@ export const fpbRouter = router({
       return { memberIds: saved };
     }),
 
+  // ==================== Departments on tasks ====================
+
+  /** Every department and its head, for the task form. */
+  getDepartments: protectedProcedure.query(async () => fpb.getDepartmentsWithHeads()),
+
+  /**
+   * Which departments a task goes to, and which one owns it. The project
+   * manager's call; new departments' heads are added and told.
+   */
+  setTaskDepartments: protectedProcedure
+    .input(
+      z.object({
+        taskId: objectId,
+        departmentIds: z.array(objectId).min(1, "Pick at least one department").max(10),
+        ownerDepartmentId: objectId.optional(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getTask(input.taskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const task = found.task as any;
+      const projectId = String(task.projectId);
+      const project = await requireTaskManager(ctx, projectId);
+
+      const departmentIds = [...new Set(input.departmentIds)];
+      const all = await fpb.getDepartmentsWithHeads();
+      const chosen = all.filter(d => departmentIds.includes(d.id));
+      if (chosen.length !== departmentIds.length) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Unknown department" });
+      }
+      const owner = resolveOwnerDepartment(departmentIds, input.ownerDepartmentId ?? null);
+      const before = new Set(((task.departmentIds ?? []) as unknown[]).map(String));
+      let saved = await fpb.setTaskDepartments(input.taskId, departmentIds, owner);
+      // A card handed to departments for the first time starts in their backlog.
+      if (before.size === 0 && !task.completed && task.status !== "done" && task.status !== "backlog") {
+        saved = (await applyStage(ctx, { ...task, departmentIds }, project, "backlog")) ?? saved;
+      }
+
+      const added = chosen.filter(d => !before.has(d.id));
+      const newHeads = added.map(d => d.headUserId).filter((id): id is string => Boolean(id));
+      if (newHeads.length > 0) {
+        await fpb.addProjectMembers(projectId, newHeads);
+        await fpb.addTaskMembers(input.taskId, newHeads);
+      }
+      await fpb.logActivity(
+        projectId,
+        ctx.user.id,
+        "changed the departments",
+        chosen.map(d => d.name).join(", "),
+        input.taskId
+      );
+      for (const d of added.filter(x => x.headUserId)) {
+        await notify([d.headUserId!], ctx.user.id, {
+          title: `New task for ${d.name}`,
+          message: `"${task.title}" in ${(project as any).title} is in ${d.name}'s backlog. Assign it to someone in your team.`,
+          projectId,
+          taskId: input.taskId,
+          type: "task_assigned",
+        });
+      }
+      return saved;
+    }),
+
+  /** The people a department head can put on a task: their department. */
+  getDepartmentPeople: protectedProcedure
+    .input(z.object({ departmentId: objectId }))
+    .query(async ({ ctx, input }) => {
+      if (!isOrgWide(ctx.user.role)) {
+        const led = await departmentsLedBy(ctx.user.id);
+        if (!led.includes(input.departmentId)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
+        }
+      }
+      return fpb.getDepartmentPeople(input.departmentId);
+    }),
+
+  /**
+   * A department head puts someone from their department on a task (or takes
+   * them off). Only the head of that department, or an admin.
+   */
+  assignForDepartment: protectedProcedure
+    .input(z.object({ taskId: objectId, departmentId: objectId, userId: objectId.nullable() }))
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getTask(input.taskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const task = found.task as any;
+      const projectId = String(task.projectId);
+      const taskDepartments = ((task.departmentIds ?? []) as unknown[]).map(String);
+      if (!taskDepartments.includes(input.departmentId)) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "This task is not with that department" });
+      }
+      const departments = await fpb.getDepartmentsWithHeads();
+      const department = departments.find(d => d.id === input.departmentId);
+      const isHead = department?.headUserId === ctx.user.id;
+      if (!isHead && !isOrgWide(ctx.user.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Only that department's head can assign this task" });
+      }
+      if (input.userId) {
+        const people = (await fpb.getDepartmentPeople(input.departmentId)).map(p => p.id);
+        if (!people.includes(input.userId) && input.userId !== department?.headUserId) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "That person is not in this department" });
+        }
+      }
+      const project = await fpb.getProject(projectId);
+      if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
+
+      const previous = ((task.assignees ?? []) as any[]).find(a => String(a.departmentId) === input.departmentId);
+      const saved = await fpb.assignForDepartment(input.taskId, input.departmentId, input.userId);
+      if (input.userId) {
+        await fpb.addProjectMembers(projectId, [input.userId]);
+        await fpb.addTaskMembers(input.taskId, [input.userId]);
+      }
+      const people = input.userId ? (await fpb.getBoardUsers()).find(u => u.id === input.userId) : null;
+      await fpb.logActivity(
+        projectId,
+        ctx.user.id,
+        input.userId ? "assigned the task" : "unassigned the task",
+        `${department?.name ?? "Department"}${people ? `: ${people.name}` : ""}`,
+        input.taskId
+      );
+      if (input.userId && String(previous?.userId ?? "") !== input.userId) {
+        await notify([input.userId], ctx.user.id, {
+          title: "Task assigned to you",
+          message: `You have been assigned "${task.title}" in ${(project as any).title}.`,
+          projectId,
+          taskId: input.taskId,
+          type: "task_assigned",
+        });
+      }
+      return saved;
+    }),
+
+  /**
+   * A department's board: every task handed to it across projects, by stage.
+   * Heads see the departments they lead (and assign from here); people see
+   * their own department's; admins any.
+   */
+  getDepartmentBoard: protectedProcedure
+    .input(z.object({ departmentId: objectId.optional() }).optional())
+    .query(async ({ ctx, input }) => {
+      const all = await fpb.getDepartmentsWithHeads();
+      const mine = await departmentsOf(ctx);
+      const visible = isOrgWide(ctx.user.role) ? all : all.filter(d => mine.all.includes(d.id));
+      if (visible.length === 0) {
+        return { departments: [], department: null, tasks: [], people: [], canAssign: false };
+      }
+      const department =
+        (input?.departmentId && visible.find(d => d.id === input.departmentId)) ||
+        visible.find(d => mine.led.includes(d.id)) ||
+        visible[0];
+      if (input?.departmentId && department.id !== input.departmentId) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
+      }
+      const canAssign = isOrgWide(ctx.user.role) || department.headUserId === ctx.user.id;
+      const [tasks, people] = await Promise.all([
+        fpb.getDepartmentBoardTasks(department.id),
+        fpb.getDepartmentPeople(department.id),
+      ]);
+      return { departments: visible, department, tasks, people, canAssign };
+    }),
+
+  /** Moves a task to a stage from the department board (or anywhere without columns). */
+  setTaskStage: protectedProcedure
+    .input(z.object({ taskId: objectId, status: WORK_STATUS }))
+    .mutation(async ({ ctx, input }) => {
+      const found = await fpb.getTask(input.taskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const project = await requireTaskAccess(ctx, found.task);
+      return applyStage(ctx, found.task, project, input.status);
+    }),
+
+  /**
+   * A card's tracking: every stage it went through, when and for how long,
+   * and the full log of what happened to it.
+   */
+  getTaskTracking: protectedProcedure
+    .input(z.object({ taskId: objectId }))
+    .query(async ({ ctx, input }) => {
+      const found = await fpb.getTask(input.taskId);
+      if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
+      const task = found.task as any;
+      await requireTaskAccess(ctx, task);
+      const events = await fpb.getTaskStatusEvents(input.taskId);
+      const current = task.completed ? "done" : String(task.status ?? "todo");
+      // The first entry without a "from" is the task being created (in its
+      // first stage); older tasks start from the first change's "from".
+      const creation = events[0] && !events[0].fromStatus ? events[0] : null;
+      const initialStatus = creation ? creation.toStatus : events[0]?.fromStatus ?? current;
+      const timeline = buildStageTimeline({
+        createdAt: task.createdAt,
+        initialStatus,
+        events: creation ? events.slice(1) : events,
+        now: new Date(),
+      });
+      const users = await fpb.getBoardUsers();
+      const nameOf = new Map(users.map(u => [u.id, u.name]));
+      return {
+        ...timeline,
+        events: events.map(e => ({ ...e, userName: nameOf.get(e.userId) ?? "Someone" })),
+      };
+    }),
+
+  /**
+   * The owner's KPIs per department for a month: work held, where it sits,
+   * overdue, done on time, how fast, and how active. Admins only.
+   */
+  getDepartmentKpis: protectedProcedure
+    .input(
+      z.object({
+        month: z.number().int().min(1).max(12),
+        year: z.number().int().min(2020).max(2100),
+      })
+    )
+    .query(async ({ ctx, input }) => {
+      if (!isOrgWide(ctx.user.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Only admins can see every department" });
+      }
+      const { start, end } = getMonthRange(input.month, input.year);
+      const now = new Date();
+      const [departments, tasks, activity] = await Promise.all([
+        fpb.getDepartmentsWithHeads(),
+        fpb.getDepartmentKpiTasks(),
+        fpb.countDepartmentActivity(new Date(now.getTime() - 7 * 86400000)),
+      ]);
+      return summarizeDepartmentKpis({
+        departments: departments.map(d => ({ id: d.id, name: d.name, headName: d.headName })),
+        tasks,
+        activityCounts: activity,
+        start,
+        end,
+        now,
+      });
+    }),
+
+  /** One department's activity log: admins, or that department's head. */
+  getDepartmentActivity: protectedProcedure
+    .input(z.object({ departmentId: objectId, limit: z.number().int().min(1).max(200).default(50) }))
+    .query(async ({ ctx, input }) => {
+      if (!isOrgWide(ctx.user.role)) {
+        const led = await departmentsLedBy(ctx.user.id);
+        if (!led.includes(input.departmentId)) {
+          throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
+        }
+      }
+      return fpb.getDepartmentActivity(input.departmentId, input.limit);
+    }),
+
+  /** The caller's own tasks on the board (home page, reports). */
+  getMyTasks: protectedProcedure.query(async ({ ctx }) => fpb.getPersonBoardTasks(ctx.user.id)),
+
+  /** The caller's active projects and completed-task count (account page). */
+  getMyStats: protectedProcedure.query(async ({ ctx }) => fpb.getPersonBoardStats(ctx.user.id)),
+
+  /**
+   * One person's projects and tasks, for reports: their own, or (for admins
+   * and the person's department head) someone else's.
+   */
+  getPersonWork: protectedProcedure
+    .input(z.object({ employeeId: objectId.optional() }).optional())
+    .query(async ({ ctx, input }) => {
+      const who = input?.employeeId ?? ctx.user.id;
+      if (who !== ctx.user.id) await requireCanViewEmployee(ctx, who);
+      const [tasks, projects] = await Promise.all([
+        fpb.getPersonBoardTasks(who),
+        fpb.getProjects({ visibleTo: who }),
+      ]);
+      return { tasks, projects };
+    }),
+
+  /** Work moving right now across the company, for the admin overview. */
+  getOngoingTasks: protectedProcedure.query(async ({ ctx }) => {
+    if (!isOrgWide(ctx.user.role)) {
+      throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
+    }
+    return fpb.getOngoingBoardTasks();
+  }),
+
+  /** The caller's day on the board, for the clock-out dialog. */
+  getMyDay: protectedProcedure.query(async ({ ctx }) =>
+    fpb.getMyDayTasks(ctx.user.id, officeDayStart(new Date(), OFFSET_MINUTES))
+  ),
+
+  /**
+   * Logs a piece of work done today, from the clock-out dialog: a card on one
+   * of the caller's projects, assigned to them, in the stage they pick. Not for
+   * department work: that comes from the project manager through the heads.
+   */
+  logMyWork: protectedProcedure
+    .input(
+      z.object({
+        projectId: objectId,
+        title: z.string().trim().min(1).max(500),
+        done: z.boolean(),
+      })
+    )
+    .mutation(async ({ ctx, input }) => {
+      await requireProjectAccess(ctx, input.projectId);
+      // Into the column for its stage, so the board and the status agree.
+      const columns = ((await fpb.getColumns(input.projectId)) as any[]).map(c => ({
+        id: String(c.id), name: String(c.name), position: Number(c.position ?? 0),
+      }));
+      const task = await fpb.createTask({
+        projectId: input.projectId,
+        title: input.title,
+        assignedTo: ctx.user.id,
+        createdBy: ctx.user.id,
+        status: "in_progress",
+        columnId: columnForStage(columns, input.done ? "done" : "in_progress") ?? undefined,
+      });
+      const saved = input.done
+        ? await fpb.updateTask(task.id!, { status: "done", completed: true }, ctx.user.id)
+        : task;
+      await fpb.logActivity(input.projectId, ctx.user.id, "added task", input.title, task.id, {
+        toStatus: input.done ? "done" : "in_progress",
+      });
+      return saved;
+    }),
+
   // ==================== Subtasks ====================
 
   createSubtask: protectedProcedure
     .input(z.object({ taskId: objectId, title: z.string().min(1).max(500) }))
     .mutation(async ({ ctx, input }) => {
-      const projectId = await projectIdForTask(input.taskId);
-      await requireProjectAccess(ctx, projectId);
+      const projectId = await requireTaskAccessById(ctx, input.taskId);
       const created = await fpb.createSubtask(input.taskId, input.title);
       await fpb.logActivity(projectId, ctx.user.id, "added checklist item", input.title, input.taskId);
       return created;
@@ -900,8 +1543,7 @@ export const fpbRouter = router({
     .mutation(async ({ ctx, input }) => {
       const found = await fpb.getSubtask(input.id);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
-      const projectId = await projectIdForTask(String((found.subtask as any).taskId));
-      await requireProjectAccess(ctx, projectId);
+      const projectId = await requireTaskAccessById(ctx, String((found.subtask as any).taskId));
       const { id, ...updates } = input;
       const saved = await fpb.updateSubtask(id, updates);
       if (input.completed !== undefined && input.completed !== Boolean((found.subtask as any).completed)) {
@@ -935,7 +1577,8 @@ export const fpbRouter = router({
       const found = await fpb.getTask(input.taskId);
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Task not found" });
       const projectId = String((found.task as any).projectId);
-      const project = await requireProjectAccess(ctx, projectId);
+      // Department people working the task from their board can talk on it.
+      const project = await requireTaskAccess(ctx, found.task);
       const created = await fpb.addTaskComment(input.taskId, ctx.user.id, input.comment);
       await fpb.logActivity(projectId, ctx.user.id, "commented on", (found.task as any).title, input.taskId);
 
@@ -1092,6 +1735,43 @@ export const fpbRouter = router({
         year: input.year,
         start,
         end,
+        now: new Date(),
+      });
+    }),
+
+  /**
+   * The owner's view: every project grouped by the department that runs it,
+   * with progress and overdue work. Admins and heads of operations only.
+   */
+  getOverview: protectedProcedure
+    .input(z.object({ status: z.enum(["active", "on_hold", "completed", "archived"]).optional() }).optional())
+    .query(async ({ ctx, input }) => {
+      if (!isOrgWide(ctx.user.role)) {
+        throw new TRPCError({ code: "FORBIDDEN", message: "Only admins can see every project" });
+      }
+      const [projects, tasks, users, departments] = await Promise.all([
+        fpb.getProjects(input?.status ? { status: input.status } : undefined),
+        fpb.getOverviewTasks(),
+        fpb.getPeopleForMetrics(),
+        listDepartments(),
+      ]);
+      return summarizeOverview({
+        projects: (projects as any[]).map(p => ({
+          id: String(p.id),
+          title: p.title,
+          projectType: p.projectType,
+          scopes: p.scopes ?? [],
+          status: p.status,
+          priority: p.priority,
+          startDate: p.startDate ?? null,
+          dueDate: p.dueDate ?? null,
+          createdBy: String(p.createdBy),
+          memberIds: (p.memberIds ?? []).map(String),
+          updatedAt: p.updatedAt ?? null,
+        })),
+        tasks,
+        users,
+        departments: departments.map(d => ({ id: d.id, name: d.name, headUserId: d.headUserId })),
         now: new Date(),
       });
     }),

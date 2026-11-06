@@ -8,7 +8,7 @@
  */
 import mongoose, { Types } from "mongoose";
 import { connectToMongoDB } from "./mongodb";
-import { User } from "./models";
+import { Department, User } from "./models";
 import {
   FpbActivity,
   FpbAnnotation,
@@ -403,12 +403,14 @@ export async function backfillSubprojects() {
  */
 export async function getProjects(filters?: {
   projectType?: string;
+  scope?: string;
   status?: string;
   visibleTo?: string;
 }) {
   await requireDb();
   const query: Record<string, unknown> = {};
   if (filters?.projectType) query.projectType = filters.projectType;
+  if (filters?.scope) query.scopes = filters.scope;
   if (filters?.status) query.status = filters.status;
 
   if (filters?.visibleTo) {
@@ -480,8 +482,10 @@ export async function getProject(id: string) {
 export async function createProject(input: {
   title: string;
   description?: string;
-  projectType: string;
+  projectType?: string;
+  scopes?: string[];
   priority?: string;
+  startDate?: Date;
   dueDate?: Date;
   createdBy: string;
   memberIds?: string[];
@@ -492,8 +496,10 @@ export async function createProject(input: {
   const project = await FpbProject.create({
     title: input.title,
     description: input.description,
-    projectType: input.projectType,
+    projectType: input.projectType ?? "other",
+    scopes: input.scopes ?? [],
     priority: input.priority ?? "medium",
+    startDate: input.startDate,
     dueDate: input.dueDate,
     createdBy: toObjectId(input.createdBy),
   });
@@ -775,6 +781,9 @@ export async function createTask(input: {
   createdBy: string;
   memberIds?: string[];
   labelIds?: string[];
+  departmentIds?: string[];
+  ownerDepartmentId?: string | null;
+  status?: string;
 }) {
   await requireDb();
   const projectId = toObjectId(input.projectId);
@@ -810,6 +819,11 @@ export async function createTask(input: {
     position,
     createdBy: toObjectId(input.createdBy),
     labelIds: [...new Set(input.labelIds ?? [])].filter(isValidId),
+    departmentIds: [...new Set(input.departmentIds ?? [])].filter(isValidId).map(toObjectId),
+    ownerDepartmentId: input.ownerDepartmentId && isValidId(input.ownerDepartmentId)
+      ? toObjectId(input.ownerDepartmentId)
+      : undefined,
+    ...(input.status ? { status: input.status } : {}),
   });
 
   if (input.memberIds?.length) {
@@ -1085,6 +1099,17 @@ export async function getPeopleForMetrics(userIds?: string[]) {
   }));
 }
 
+/** Every task's project, completion and due date: enough for the owner's overview. */
+export async function getOverviewTasks() {
+  await requireDb();
+  const tasks = await FpbTask.find({}, { projectId: 1, completed: 1, dueDate: 1 }).lean();
+  return tasks.map(t => ({
+    projectId: String(t.projectId),
+    completed: Boolean(t.completed),
+    dueDate: t.dueDate ?? null,
+  }));
+}
+
 /** Everyone in the given departments. */
 export async function getPeopleInDepartments(departmentIds: string[]) {
   await requireDb();
@@ -1245,16 +1270,26 @@ export async function logActivity(
   userId: string,
   action: string,
   detail?: string,
-  taskId?: string
+  taskId?: string,
+  change?: { fromStatus?: string; toStatus?: string; fromColumn?: string; toColumn?: string }
 ) {
   // Never let an audit write break the action it is recording.
   try {
+    // Stamp the task's departments on the entry, so each department's activity
+    // log can be read without joining back to the task (which may be deleted).
+    let departmentIds: Types.ObjectId[] | undefined;
+    if (taskId && isValidId(taskId)) {
+      const task = await FpbTask.findById(toObjectId(taskId), { departmentIds: 1 }).lean();
+      if (task?.departmentIds?.length) departmentIds = task.departmentIds as Types.ObjectId[];
+    }
     await FpbActivity.create({
       projectId: toObjectId(projectId),
       taskId: taskId && isValidId(taskId) ? taskId : undefined,
       userId: toObjectId(userId),
       action,
       detail,
+      departmentIds,
+      ...(change ?? {}),
     });
   } catch (error) {
     console.error("[FPB] failed to log activity", action, error);
@@ -1310,4 +1345,380 @@ export async function getBoardUsers() {
     avatar: u.avatar ?? null,
     role: u.role,
   }));
+}
+
+
+// ==================== Departments on tasks ====================
+
+/** Every department with its head, for the task form and the department board. */
+export async function getDepartmentsWithHeads() {
+  await requireDb();
+  const departments = await Department.find({}, { name: 1, headUserId: 1 }).sort({ name: 1 }).lean();
+  const headIds = departments.map(d => d.headUserId).filter(Boolean) as Types.ObjectId[];
+  const heads = await User.find({ _id: { $in: headIds } }, { name: 1, avatar: 1 }).lean();
+  const byId = new Map(heads.map(h => [String(h._id), h]));
+  return departments.map(d => {
+    const head = d.headUserId ? byId.get(String(d.headUserId)) : undefined;
+    return {
+      id: String(d._id),
+      name: d.name,
+      headUserId: d.headUserId ? String(d.headUserId) : null,
+      headName: head?.name ?? null,
+      headAvatar: head?.avatar ?? null,
+    };
+  });
+}
+
+/** The people in one department (their own department set to it). */
+export async function getDepartmentPeople(departmentId: string) {
+  await requireDb();
+  if (!isValidId(departmentId)) return [];
+  const users = await User.find(
+    { departmentId: toObjectId(departmentId) },
+    { name: 1, position: 1, avatar: 1, employeeId: 1 }
+  ).sort({ name: 1 }).lean();
+  return users.map(u => ({
+    id: String(u._id),
+    name: u.name ?? u.employeeId ?? "Employee",
+    position: u.position ?? "",
+    avatar: u.avatar ?? null,
+  }));
+}
+
+/** Adds people to a project without removing anyone (unlike setProjectMembers). */
+export async function addProjectMembers(projectId: string, userIds: string[]) {
+  await requireDb();
+  const pid = toObjectId(projectId);
+  const unique = [...new Set(userIds)].filter(isValidId);
+  for (const id of unique) {
+    await FpbProjectMember.updateOne(
+      { projectId: pid, userId: toObjectId(id) },
+      { $setOnInsert: { projectId: pid, userId: toObjectId(id) } },
+      { upsert: true }
+    );
+  }
+}
+
+/** Adds people to a card's members without removing anyone. */
+export async function addTaskMembers(taskId: string, userIds: string[]) {
+  await requireDb();
+  const tid = toObjectId(taskId);
+  const unique = [...new Set(userIds)].filter(isValidId);
+  for (const id of unique) {
+    await FpbTaskMember.updateOne(
+      { taskId: tid, userId: toObjectId(id) },
+      { $setOnInsert: { taskId: tid, userId: toObjectId(id) } },
+      { upsert: true }
+    );
+  }
+}
+
+/**
+ * Sets which departments work on a task and which one owns it. Assignments
+ * from departments no longer on it are dropped; `assignedTo` follows the
+ * owner department's assignee.
+ */
+export async function setTaskDepartments(taskId: string, departmentIds: string[], ownerDepartmentId: string | null) {
+  await requireDb();
+  const task = await FpbTask.findById(toObjectId(taskId)).lean();
+  if (!task) return null;
+  const keep = new Set(departmentIds);
+  const assignees = ((task.assignees ?? []) as any[]).filter(a => keep.has(String(a.departmentId)));
+  const ownerAssignee = ownerDepartmentId
+    ? assignees.find(a => String(a.departmentId) === ownerDepartmentId)
+    : undefined;
+  const set: Record<string, unknown> = {
+    departmentIds: departmentIds.map(toObjectId),
+    assignees,
+  };
+  const unset: Record<string, 1> = {};
+  if (ownerDepartmentId) set.ownerDepartmentId = toObjectId(ownerDepartmentId);
+  else unset.ownerDepartmentId = 1;
+  if (departmentIds.length > 0) {
+    if (ownerAssignee) set.assignedTo = ownerAssignee.userId;
+    else unset.assignedTo = 1;
+  }
+  const update: Record<string, unknown> = { $set: set };
+  if (Object.keys(unset).length > 0) update.$unset = unset;
+  const saved = await FpbTask.findByIdAndUpdate(task._id, update, { returnDocument: "after" }).lean();
+  return normalize(saved);
+}
+
+/**
+ * Puts one of a department's people on a task, or takes them off (userId
+ * null). The owner department's assignee is also the task's `assignedTo`,
+ * which the performance report credits.
+ */
+export async function assignForDepartment(taskId: string, departmentId: string, userId: string | null) {
+  await requireDb();
+  const task = await FpbTask.findById(toObjectId(taskId)).lean();
+  if (!task) return null;
+  const others = ((task.assignees ?? []) as any[]).filter(a => String(a.departmentId) !== departmentId);
+  const assignees = userId
+    ? [...others, { departmentId: toObjectId(departmentId), userId: toObjectId(userId) }]
+    : others;
+  const departments = ((task.departmentIds ?? []) as Types.ObjectId[]).map(String);
+  const owner = task.ownerDepartmentId ? String(task.ownerDepartmentId) : departments[0] ?? null;
+  const set: Record<string, unknown> = { assignees };
+  const unset: Record<string, 1> = {};
+  if (owner === departmentId) {
+    if (userId) set.assignedTo = toObjectId(userId);
+    else unset.assignedTo = 1;
+  }
+  const update: Record<string, unknown> = { $set: set };
+  if (Object.keys(unset).length > 0) update.$unset = unset;
+  const saved = await FpbTask.findByIdAndUpdate(task._id, update, { returnDocument: "after" }).lean();
+  return normalize(saved);
+}
+
+/**
+ * A department's board: every task handed to it, from every project, with the
+ * project's name and the people on it.
+ */
+export async function getDepartmentBoardTasks(departmentId: string) {
+  await requireDb();
+  if (!isValidId(departmentId)) return [];
+  const tasks = await FpbTask.find({ departmentIds: toObjectId(departmentId) })
+    .sort({ updatedAt: -1 })
+    .limit(500)
+    .lean();
+  if (tasks.length === 0) return [];
+  const taskIds = tasks.map(t => t._id);
+  const projectIds = [...new Set(tasks.map(t => String(t.projectId)))].map(toObjectId);
+  const [projects, members, commentCounts] = await Promise.all([
+    FpbProject.find({ _id: { $in: projectIds } }, { title: 1, status: 1 }).lean(),
+    FpbTaskMember.find({ taskId: { $in: taskIds } }).lean(),
+    FpbTaskComment.aggregate<{ _id: unknown; n: number }>([
+      { $match: { taskId: { $in: taskIds }, deletedAt: { $exists: false } } },
+      { $group: { _id: "$taskId", n: { $sum: 1 } } },
+    ]),
+  ]);
+  const projectById = new Map(projects.map(p => [String(p._id), p]));
+  const comments = new Map(commentCounts.map(c => [String(c._id), c.n]));
+  const membersByTask = new Map<string, string[]>();
+  for (const m of members) {
+    const key = String(m.taskId);
+    membersByTask.set(key, [...(membersByTask.get(key) ?? []), String(m.userId)]);
+  }
+  return tasks.map((t): Normalized => ({
+    ...normalize(t)!,
+    projectTitle: projectById.get(String(t.projectId))?.title ?? "Project",
+    memberIds: membersByTask.get(String(t._id)) ?? [],
+    commentCount: comments.get(String(t._id)) ?? 0,
+  }));
+}
+
+/** A task's status changes, oldest first, for its tracking timeline. */
+export async function getTaskStatusEvents(taskId: string) {
+  await requireDb();
+  const items = await FpbActivity.find(
+    { taskId: toObjectId(taskId), toStatus: { $exists: true } },
+    { toStatus: 1, fromStatus: 1, createdAt: 1, userId: 1 }
+  ).sort({ createdAt: 1 }).lean();
+  return items.map(i => ({
+    at: i.createdAt,
+    fromStatus: i.fromStatus ?? null,
+    toStatus: String(i.toStatus),
+    userId: String(i.userId),
+  }));
+}
+
+/** One department's activity log, newest first, with names attached. */
+export async function getDepartmentActivity(departmentId: string, limit: number, since?: Date) {
+  await requireDb();
+  if (!isValidId(departmentId)) return [];
+  const filter: Record<string, unknown> = { departmentIds: toObjectId(departmentId) };
+  if (since) filter.createdAt = { $gte: since };
+  const items = await FpbActivity.find(filter).sort({ createdAt: -1 }).limit(limit).lean();
+  if (items.length === 0) return [];
+  const [users, projects] = await Promise.all([
+    User.find({ _id: { $in: [...new Set(items.map(i => String(i.userId)))].map(toObjectId) } }, { name: 1, employeeId: 1 }).lean(),
+    FpbProject.find({ _id: { $in: [...new Set(items.map(i => String(i.projectId)))].map(toObjectId) } }, { title: 1 }).lean(),
+  ]);
+  const userById = new Map(users.map(u => [String(u._id), u]));
+  const projectById = new Map(projects.map(p => [String(p._id), p]));
+  return items.map(i => ({
+    ...normalize(i)!,
+    userName: userById.get(String(i.userId))?.name ?? "Someone",
+    projectTitle: projectById.get(String(i.projectId))?.title ?? "Project",
+  }));
+}
+
+/** Every department task, trimmed to what the department KPIs need. */
+export async function getDepartmentKpiTasks() {
+  await requireDb();
+  const tasks = await FpbTask.find(
+    { "departmentIds.0": { $exists: true } },
+    {
+      projectId: 1, departmentIds: 1, ownerDepartmentId: 1, status: 1, completed: 1,
+      completedAt: 1, createdAt: 1, dueDate: 1, assignees: 1,
+    }
+  ).lean();
+  return tasks.map(t => ({
+    id: String(t._id),
+    projectId: String(t.projectId),
+    departmentIds: ((t.departmentIds ?? []) as Types.ObjectId[]).map(String),
+    ownerDepartmentId: t.ownerDepartmentId ? String(t.ownerDepartmentId) : null,
+    status: String(t.status),
+    completed: Boolean(t.completed),
+    completedAt: t.completedAt ?? null,
+    createdAt: t.createdAt,
+    dueDate: t.dueDate ?? null,
+    assignees: ((t.assignees ?? []) as any[]).map(a => ({ departmentId: String(a.departmentId), userId: String(a.userId) })),
+  }));
+}
+
+/** How many activity entries each department has had since a date. */
+export async function countDepartmentActivity(since: Date) {
+  await requireDb();
+  const rows = await FpbActivity.aggregate<{ _id: unknown; n: number }>([
+    { $match: { createdAt: { $gte: since }, "departmentIds.0": { $exists: true } } },
+    { $unwind: "$departmentIds" },
+    { $group: { _id: "$departmentIds", n: { $sum: 1 } } },
+  ]);
+  return new Map(rows.map(r => [String(r._id), r.n]));
+}
+
+
+/** The department a person belongs to, if any. */
+export async function getUserDepartmentId(userId: string): Promise<string | null> {
+  await requireDb();
+  if (!isValidId(userId)) return null;
+  const user = await User.findById(toObjectId(userId), { departmentId: 1 }).lean();
+  return user?.departmentId ? String(user.departmentId) : null;
+}
+
+
+/**
+ * A person's day on the board, for the clock-out dialog: what they finished
+ * today, and what is still open on their plate (marking the ones they touched
+ * today).
+ */
+export async function getMyDayTasks(userId: string, dayStart: Date) {
+  await requireDb();
+  const me = toObjectId(userId);
+  const [mine, finishedByMe, touched] = await Promise.all([
+    FpbTask.find({ $or: [{ assignedTo: me }, { "assignees.userId": me }] })
+      .sort({ updatedAt: -1 })
+      .limit(200)
+      .lean(),
+    FpbTask.find({ completedBy: me, completedAt: { $gte: dayStart } }).lean(),
+    FpbActivity.distinct("taskId", { userId: me, createdAt: { $gte: dayStart }, taskId: { $exists: true } }),
+  ]);
+  const touchedIds = new Set(touched.map(String));
+  const byId = new Map<string, any>();
+  for (const t of [...mine, ...finishedByMe]) byId.set(String(t._id), t);
+  const tasks = [...byId.values()];
+  const projects = await FpbProject.find(
+    { _id: { $in: [...new Set(tasks.map(t => String(t.projectId)))].map(toObjectId) } },
+    { title: 1 }
+  ).lean();
+  const titleOf = new Map(projects.map(p => [String(p._id), p.title]));
+  const shape = (t: any) => ({
+    id: String(t._id),
+    projectId: String(t.projectId),
+    projectTitle: titleOf.get(String(t.projectId)) ?? "Project",
+    title: t.title,
+    status: t.completed ? "done" : String(t.status ?? "todo"),
+    dueDate: t.dueDate ?? null,
+    departmentTask: ((t.departmentIds ?? []) as unknown[]).length > 0,
+    touchedToday: touchedIds.has(String(t._id)),
+    completedAt: t.completedAt ?? null,
+  });
+  const doneToday = tasks
+    .filter(t => (t.completed || t.status === "done") && t.completedAt && new Date(t.completedAt) >= dayStart)
+    .map(shape);
+  const open = tasks.filter(t => !t.completed && t.status !== "done").map(shape);
+  return { doneToday, open };
+}
+
+
+/**
+ * One person's tasks on the board: assigned to them directly or through a
+ * department. Feeds the home page, reports, Wingman and the morning brief.
+ */
+export async function getPersonBoardTasks(userId: string, limit = 300) {
+  await requireDb();
+  if (!isValidId(userId)) return [];
+  const me = toObjectId(userId);
+  const tasks = await FpbTask.find({ $or: [{ assignedTo: me }, { "assignees.userId": me }] })
+    .sort({ updatedAt: -1 })
+    .limit(limit)
+    .lean();
+  if (tasks.length === 0) return [];
+  const projects = await FpbProject.find(
+    { _id: { $in: [...new Set(tasks.map(t => String(t.projectId)))].map(toObjectId) } },
+    { title: 1, status: 1 }
+  ).lean();
+  const projectById = new Map(projects.map(p => [String(p._id), p]));
+  return tasks.map(t => {
+    const done = Boolean(t.completed) || t.status === "done";
+    return {
+      id: String(t._id),
+      projectId: String(t.projectId),
+      projectTitle: projectById.get(String(t.projectId))?.title ?? "Project",
+      title: t.title,
+      description: t.description ?? "",
+      status: done ? "done" : String(t.status ?? "todo"),
+      done,
+      priority: t.priority ?? "medium",
+      dueDate: t.dueDate ?? null,
+      completedAt: t.completedAt ?? null,
+      createdAt: t.createdAt,
+      departmentTask: ((t.departmentIds ?? []) as unknown[]).length > 0,
+    };
+  });
+}
+
+/** Open work that is moving right now across the company, newest first. */
+export async function getOngoingBoardTasks(limit = 30) {
+  await requireDb();
+  const tasks = await FpbTask.find(
+    { completed: false, status: { $in: ["in_progress", "in_review", "blocked"] } },
+    { title: 1, projectId: 1, status: 1, dueDate: 1, assignedTo: 1, assignees: 1, updatedAt: 1 }
+  ).sort({ updatedAt: -1 }).limit(limit).lean();
+  if (tasks.length === 0) return [];
+  const userIds = new Set<string>();
+  for (const t of tasks) {
+    if (t.assignedTo) userIds.add(String(t.assignedTo));
+    for (const a of (t.assignees ?? []) as any[]) userIds.add(String(a.userId));
+  }
+  const [projects, users] = await Promise.all([
+    FpbProject.find({ _id: { $in: [...new Set(tasks.map(t => String(t.projectId)))].map(toObjectId) } }, { title: 1 }).lean(),
+    User.find({ _id: { $in: [...userIds].map(toObjectId) } }, { name: 1 }).lean(),
+  ]);
+  const projectTitle = new Map(projects.map(p => [String(p._id), p.title]));
+  const userName = new Map(users.map(u => [String(u._id), u.name ?? "Employee"]));
+  return tasks.map(t => {
+    const people = [...new Set([
+      ...(t.assignedTo ? [String(t.assignedTo)] : []),
+      ...((t.assignees ?? []) as any[]).map(a => String(a.userId)),
+    ])];
+    return {
+      id: String(t._id),
+      projectId: String(t.projectId),
+      projectTitle: projectTitle.get(String(t.projectId)) ?? "Project",
+      title: t.title,
+      status: String(t.status),
+      dueDate: t.dueDate ?? null,
+      assignees: people.map(id => userName.get(id) ?? "Employee"),
+      updatedAt: t.updatedAt,
+    };
+  });
+}
+
+/** How many projects a person is on that are active, and how many tasks they have completed. */
+export async function getPersonBoardStats(userId: string) {
+  await requireDb();
+  if (!isValidId(userId)) return { activeProjects: 0, completedTasks: 0 };
+  const me = toObjectId(userId);
+  const memberships = await FpbProjectMember.find({ userId: me }, { projectId: 1 }).lean();
+  const [activeProjects, completedTasks] = await Promise.all([
+    FpbProject.countDocuments({
+      status: "active",
+      $or: [{ createdBy: me }, { _id: { $in: memberships.map(m => m.projectId) } }],
+    }),
+    FpbTask.countDocuments({ completedBy: me, completed: true }),
+  ]);
+  return { activeProjects, completedTasks };
 }

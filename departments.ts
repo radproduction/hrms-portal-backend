@@ -383,14 +383,37 @@ export async function canOpenProjects(actor: {
   role?: string;
 }): Promise<boolean> {
   if (isOrgWide(actor.role)) return true;
-  if (!hasRank(actor.role, "dept_head")) return false;
-
+  // A grant to the person (the project manager), not to a department or a
+  // role: department heads and employees cannot open projects unless an
+  // admin has granted it to them by name.
   await requireDb();
-  const granted = await Department.countDocuments({
-    headUserId: toId(actor.id),
-    canCreateProjects: true,
-  });
-  return granted > 0;
+  const user = await User.findById(toId(actor.id), { canCreateProjects: 1 }).lean();
+  return Boolean(user?.canCreateProjects);
+}
+
+/** Grants or withdraws one person's right to open projects. */
+export async function setUserProjectRights(userId: string, allowed: boolean) {
+  await requireDb();
+  const saved = await User.findByIdAndUpdate(
+    toId(userId),
+    { canCreateProjects: allowed },
+    { returnDocument: "after" }
+  ).lean();
+  return saved ? { id: String(saved._id), canCreateProjects: Boolean(saved.canCreateProjects) } : null;
+}
+
+/** The people who may open projects, besides admins and heads of operations. */
+export async function listProjectCreators() {
+  await requireDb();
+  const users = await User.find({ canCreateProjects: true }, { name: 1, position: 1, department: 1 })
+    .sort({ name: 1 })
+    .lean();
+  return users.map(u => ({
+    id: String(u._id),
+    name: u.name ?? "",
+    position: u.position ?? "",
+    department: u.department ?? "",
+  }));
 }
 
 /**

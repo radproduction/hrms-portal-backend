@@ -18,6 +18,8 @@ export interface IUser extends Document {
   /** The department record, which is what resolves to a head. */
   departmentId?: Types.ObjectId;
   position?: string;
+  /** Granted by an admin: may open projects on the board (the project manager). */
+  canCreateProjects?: boolean;
   createdAt: Date;
   updatedAt: Date;
   lastSignedIn: Date;
@@ -43,6 +45,7 @@ const userSchema = new Schema<IUser>({
   avatar: String,
   department: String,
   position: String,
+  canCreateProjects: { type: Boolean, default: false },
   lastSignedIn: { type: Date, default: Date.now },
 }, { timestamps: true });
 
@@ -173,8 +176,9 @@ export interface IOvertimeEntry extends Document {
 
 const overtimeEntrySchema = new Schema<IOvertimeEntry>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  projectId: { type: Schema.Types.ObjectId, ref: 'Project', required: true },
-  taskId: { type: Schema.Types.ObjectId, ref: 'ProjectTask', required: true },
+  // A board project and task (FpbProject / FpbTask).
+  projectId: { type: Schema.Types.ObjectId, ref: 'FpbProject', required: true },
+  taskId: { type: Schema.Types.ObjectId, ref: 'FpbTask', required: true },
   workDate: { type: Date, required: true },
   hours: { type: Number, required: true },
   description: String,
@@ -379,83 +383,8 @@ const announcementSchema = new Schema<IAnnouncement>({
 
 export const Announcement = model<IAnnouncement>('Announcement', announcementSchema);
 
-// ==================== Project Model ====================
-export interface IProject extends Document {
-  _id: Types.ObjectId;
-  name: string;
-  description?: string;
-  status: 'active' | 'on_hold' | 'completed' | 'cancelled';
-  priority: 'low' | 'medium' | 'high';
-  source: 'team_lead' | 'employee';
-  startDate?: Date;
-  endDate?: Date;
-  createdBy: Types.ObjectId;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const projectSchema = new Schema<IProject>({
-  name: { type: String, required: true },
-  description: String,
-  status: { type: String, enum: ['active', 'on_hold', 'completed', 'cancelled'], default: 'active', required: true },
-  priority: { type: String, enum: ['low', 'medium', 'high'], default: 'medium', required: true },
-  source: { type: String, enum: ['team_lead', 'employee'], default: 'team_lead', required: true },
-  startDate: Date,
-  endDate: Date,
-  createdBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-}, { timestamps: true });
-
-export const Project = model<IProject>('Project', projectSchema);
-
-// ==================== Project Assignment Model ====================
-export interface IProjectAssignment extends Document {
-  _id: Types.ObjectId;
-  projectId: Types.ObjectId;
-  userId: Types.ObjectId;
-  role?: string;
-  assignedAt: Date;
-}
-
-const projectAssignmentSchema = new Schema<IProjectAssignment>({
-  projectId: { type: Schema.Types.ObjectId, ref: 'Project', required: true },
-  userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  role: String,
-  assignedAt: { type: Date, default: Date.now },
-});
-
-export const ProjectAssignment = model<IProjectAssignment>('ProjectAssignment', projectAssignmentSchema);
-
-// ==================== Project Task Model ====================
-export interface IProjectTask extends Document {
-  _id: Types.ObjectId;
-  projectId: Types.ObjectId;
-  userId: Types.ObjectId;
-  assigneeIds?: Types.ObjectId[];
-  timeEntryId?: Types.ObjectId;
-  title: string;
-  description?: string;
-  status: 'todo' | 'in_progress' | 'completed' | 'blocked';
-  priority: 'low' | 'medium' | 'high';
-  completionDate?: Date;
-  completedAt?: Date;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-const projectTaskSchema = new Schema<IProjectTask>({
-  projectId: { type: Schema.Types.ObjectId, ref: 'Project', required: true },
-  userId: { type: Schema.Types.ObjectId, ref: 'User', required: true },
-  assigneeIds: [{ type: Schema.Types.ObjectId, ref: 'User' }],
-  timeEntryId: { type: Schema.Types.ObjectId, ref: 'TimeEntry' },
-  title: { type: String, required: true },
-  description: String,
-  status: { type: String, enum: ['todo', 'in_progress', 'completed', 'blocked'], default: 'todo', required: true },
-  priority: { type: String, enum: ['low', 'medium', 'high'], default: 'medium', required: true },
-  completionDate: Date,
-  completedAt: Date,
-}, { timestamps: true });
-
-export const ProjectTask = model<IProjectTask>('ProjectTask', projectTaskSchema);
+// The old Project, ProjectAssignment and ProjectTask models were removed in
+// Nov 2026: projects and tasks live on the board (fpbModels.ts).
 
 // ==================== Notification Model ====================
 export const NOTIFICATION_TYPES = [
