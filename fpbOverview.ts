@@ -2,10 +2,11 @@
  * The owner's view of the board: every project, grouped by the department
  * that runs it, with how far along it is and what is overdue.
  *
- * Projects carry no department of their own, so a project belongs to the
- * department of the person who created it (a head whose own department is
- * unset counts for the department they lead). Other departments with people
- * on it are listed alongside, so cross-team work is visible from either side.
+ * A project is listed under every department its tasks were handed to, since
+ * the project manager creates projects and the departments do the work. A
+ * project with no department tasks yet sits under its creator's department (a
+ * head whose own department is unset counts for the one they lead). Other
+ * departments involved are listed on each card.
  *
  * summarizeOverview is pure, so the grouping can be tested without a database.
  */
@@ -29,6 +30,8 @@ export type OverviewTask = {
   projectId: string;
   completed: boolean;
   dueDate?: Date | string | null;
+  /** The departments the task was handed to, if any. */
+  departmentIds?: string[];
 };
 
 export type OverviewUser = { id: string; name: string; departmentId?: string | null };
@@ -95,7 +98,15 @@ export function summarizeOverview(input: {
   const nameOf = (userId: string) => userById.get(userId)?.name || "Former employee";
 
   const stats = new Map<string, { total: number; done: number; overdue: number }>();
+  // Which departments each project's tasks went to.
+  const taskDepartments = new Map<string, Set<string>>();
   for (const t of input.tasks) {
+    for (const d of t.departmentIds ?? []) {
+      if (!deptById.has(d)) continue;
+      const set = taskDepartments.get(t.projectId) ?? new Set<string>();
+      set.add(d);
+      taskDepartments.set(t.projectId, set);
+    }
     const s = stats.get(t.projectId) ?? { total: 0, done: 0, overdue: 0 };
     s.total += 1;
     if (t.completed) s.done += 1;
@@ -106,13 +117,9 @@ export function summarizeOverview(input: {
   const sections = new Map<string, OverviewSection>();
   for (const p of input.projects) {
     const s = stats.get(p.id) ?? { total: 0, done: 0, overdue: 0 };
-    const ownerDept = deptOf(p.createdBy);
+    const working = [...(taskDepartments.get(p.id) ?? [])];
+    const homes: (string | null)[] = working.length > 0 ? working : [deptOf(p.createdBy)];
     const peopleIds = [...new Set([p.createdBy, ...p.memberIds])];
-    const also = new Set<string>();
-    for (const id of peopleIds) {
-      const d = deptOf(id);
-      if (d && d !== ownerDept) also.add(deptById.get(d)!.name);
-    }
 
     const card: OverviewCard = {
       id: p.id,
@@ -130,9 +137,21 @@ export function summarizeOverview(input: {
       overdueTasks: s.overdue,
       progress: s.total > 0 ? Math.round((s.done / s.total) * 100) : 0,
       people: peopleIds.filter(id => userById.has(id)).map(id => ({ id, name: nameOf(id) })),
-      alsoDepartments: [...also].sort(),
+      alsoDepartments: [],
     };
 
+    for (const ownerDept of homes) {
+    // On each department's card: the other departments working on it.
+    const also = new Set<string>(
+      working.filter(d => d !== ownerDept).map(d => deptById.get(d)!.name)
+    );
+    if (working.length === 0) {
+      for (const id of peopleIds) {
+        const d = deptOf(id);
+        if (d && d !== ownerDept) also.add(deptById.get(d)!.name);
+      }
+    }
+    const placed = { ...card, alsoDepartments: [...also].sort() };
     const k = ownerDept ?? "";
     const section = sections.get(k) ?? {
       id: ownerDept,
@@ -149,8 +168,9 @@ export function summarizeOverview(input: {
     section.projectCount += 1;
     section.openTasks += card.openTasks;
     section.overdueTasks += card.overdueTasks;
-    section.projects.push(card);
+    section.projects.push(placed);
     sections.set(k, section);
+    }
   }
 
   const departments = [...sections.values()]
@@ -163,7 +183,8 @@ export function summarizeOverview(input: {
     }))
     .sort((a, b) => (a.id === null ? 1 : b.id === null ? -1 : a.name.localeCompare(b.name)));
 
-  const all = departments.flatMap(d => d.projects);
+  // Each project once, though it may sit under several departments.
+  const all = [...new Map(departments.flatMap(d => d.projects).map(p => [p.id, p])).values()];
   return {
     totals: {
       projects: all.length,

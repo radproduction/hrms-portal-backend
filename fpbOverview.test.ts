@@ -57,6 +57,25 @@ describe("summarizeOverview", () => {
   });
 });
 
+describe("summarizeOverview with department tasks", () => {
+  it("lists a project under each department its tasks went to, and counts it once", () => {
+    const report = summarizeOverview({
+      now, departments, users,
+      projects: [
+        { id: "p1", title: "Website", projectType: "other", status: "active", createdBy: "owner", memberIds: [] },
+      ],
+      tasks: [
+        { projectId: "p1", completed: false, departmentIds: ["brand", "dev"] },
+        { projectId: "p1", completed: true, departmentIds: ["dev"] },
+      ],
+    });
+    expect(report.departments.map(d => d.name)).toEqual(["Brand", "Development"]);
+    expect(report.departments[0].projects[0].alsoDepartments).toEqual(["Development"]);
+    expect(report.departments[1].projects[0].alsoDepartments).toEqual(["Brand"]);
+    expect(report.totals).toMatchObject({ projects: 1, taskCount: 2, completedTasks: 1 });
+  });
+});
+
 describe("summarizeDepartmentKpis", () => {
   it("counts each department's work, lateness and pace", () => {
     const start = new Date("2026-11-01T00:00:00+05:00");

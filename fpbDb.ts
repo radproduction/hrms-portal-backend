@@ -1102,11 +1102,12 @@ export async function getPeopleForMetrics(userIds?: string[]) {
 /** Every task's project, completion and due date: enough for the owner's overview. */
 export async function getOverviewTasks() {
   await requireDb();
-  const tasks = await FpbTask.find({}, { projectId: 1, completed: 1, dueDate: 1 }).lean();
+  const tasks = await FpbTask.find({}, { projectId: 1, completed: 1, dueDate: 1, departmentIds: 1 }).lean();
   return tasks.map(t => ({
     projectId: String(t.projectId),
     completed: Boolean(t.completed),
     dueDate: t.dueDate ?? null,
+    departmentIds: ((t.departmentIds ?? []) as unknown[]).map(String),
   }));
 }
 
