@@ -8,7 +8,7 @@
 import { Schema, model, Document, Types } from 'mongoose';
 
 // ==================== Employee Request ====================
-export type EmployeeRequestKind = 'attendance_correction' | 'support_ticket';
+export type EmployeeRequestKind = 'attendance_correction' | 'support_ticket' | 'late_arrival';
 export type EmployeeRequestStatus = 'pending' | 'approved' | 'rejected' | 'resolved';
 
 export interface IEmployeeRequest extends Document {
@@ -24,13 +24,18 @@ export interface IEmployeeRequest extends Document {
   requestedTimeOut?: Date;
   /** Support tickets: what kind of problem it is. */
   category?: 'it' | 'equipment' | 'portal' | 'other';
+  /** Late arrivals: the clock-in being explained. One request per clock-in. */
+  timeEntryId?: Types.ObjectId;
   status: EmployeeRequestStatus;
   /** Who it was sent to when it was raised, same routing as leave. */
   approverUserId?: Types.ObjectId;
   reviewedBy?: Types.ObjectId;
   reviewedAt?: Date;
   reviewNote?: string;
-  /** True once an approved correction was written onto the attendance record. */
+  /**
+   * True once an approved correction was written onto the attendance record,
+   * or an approved late arrival was marked excused on it.
+   */
   appliedToAttendance?: boolean;
   createdAt: Date;
   updatedAt: Date;
@@ -38,13 +43,14 @@ export interface IEmployeeRequest extends Document {
 
 const employeeRequestSchema = new Schema<IEmployeeRequest>({
   userId: { type: Schema.Types.ObjectId, ref: 'User', required: true, index: true },
-  kind: { type: String, enum: ['attendance_correction', 'support_ticket'], required: true },
+  kind: { type: String, enum: ['attendance_correction', 'support_ticket', 'late_arrival'], required: true },
   subject: { type: String, required: true },
   details: String,
   workDate: Date,
   requestedTimeIn: Date,
   requestedTimeOut: Date,
   category: { type: String, enum: ['it', 'equipment', 'portal', 'other'] },
+  timeEntryId: { type: Schema.Types.ObjectId, ref: 'TimeEntry' },
   status: { type: String, enum: ['pending', 'approved', 'rejected', 'resolved'], default: 'pending', required: true },
   approverUserId: { type: Schema.Types.ObjectId, ref: 'User', index: true },
   reviewedBy: { type: Schema.Types.ObjectId, ref: 'User' },
@@ -52,6 +58,12 @@ const employeeRequestSchema = new Schema<IEmployeeRequest>({
   reviewNote: String,
   appliedToAttendance: { type: Boolean, default: false },
 }, { timestamps: true });
+
+// At most one late-arrival explanation per clock-in, even under a double click.
+employeeRequestSchema.index(
+  { timeEntryId: 1 },
+  { unique: true, partialFilterExpression: { kind: 'late_arrival' } }
+);
 
 export const EmployeeRequest = model<IEmployeeRequest>('EmployeeRequest', employeeRequestSchema);
 

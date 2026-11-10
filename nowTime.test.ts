@@ -1,11 +1,48 @@
 import { describe, expect, it } from "vitest";
-import { buildFourWeeks, buildLeaveBalance, leaveDateKeys, localClock } from "./nowTime";
+import { buildFourWeeks, buildLeaveBalance, explainableLateArrivals, leaveDateKeys, localClock } from "./nowTime";
 
 // Office time is UTC+5 throughout, the same default the reports use.
 const OFFSET = 300;
 const at = (date: string, time: string) => new Date(`${date}T${time}:00+05:00`);
 const WORK_WEEK = new Set([1, 2, 3, 4, 5]);
 const base = { offsetMinutes: OFFSET, workWeek: WORK_WEEK, shiftStartMinutes: 600, lateGraceMinutes: 15, maxShiftHours: 14 };
+
+describe("explainableLateArrivals", () => {
+  const lateAfterMinutes = 13 * 60;
+  const opts = { offsetMinutes: OFFSET, workWeek: WORK_WEEK, lateAfterMinutes };
+
+  it("lists a late first clock-in for 48 hours, then drops it", () => {
+    // Tuesday 10 November 2026, in at 13:24.
+    const entries = [{ id: "a", timeIn: at("2026-11-10", "13:24") }];
+    const soon = explainableLateArrivals({ entries, now: at("2026-11-10", "14:00"), ...opts });
+    expect(soon).toHaveLength(1);
+    expect(soon[0]).toMatchObject({ timeEntryId: "a", date: "2026-11-10", clock: "13:24" });
+    expect(soon[0].deadline.toISOString()).toBe(at("2026-11-12", "13:24").toISOString());
+
+    expect(explainableLateArrivals({ entries, now: at("2026-11-12", "13:23"), ...opts })).toHaveLength(1);
+    expect(explainableLateArrivals({ entries, now: at("2026-11-12", "13:24"), ...opts })).toHaveLength(0);
+  });
+
+  it("ignores on-time days, later clock-ins the same day, weekends and excused days", () => {
+    const now = at("2026-11-10", "20:00");
+    const result = explainableLateArrivals({
+      entries: [
+        { id: "ontime", timeIn: at("2026-11-10", "12:55") },
+        { id: "back-from-break", timeIn: at("2026-11-10", "15:30") },
+        { id: "excused", timeIn: at("2026-11-09", "14:10"), lateExcused: true },
+        { id: "sunday", timeIn: at("2026-11-08", "16:00") },
+      ],
+      now, ...opts,
+    });
+    expect(result).toEqual([]);
+  });
+
+  it("exactly 1:00 PM is on time; 1:01 PM is late", () => {
+    const now = at("2026-11-10", "20:00");
+    expect(explainableLateArrivals({ entries: [{ id: "x", timeIn: at("2026-11-10", "13:00") }], now, ...opts })).toHaveLength(0);
+    expect(explainableLateArrivals({ entries: [{ id: "y", timeIn: at("2026-11-10", "13:01") }], now, ...opts })).toHaveLength(1);
+  });
+});
 
 describe("buildFourWeeks", () => {
   // Friday 2 October 2026, mid afternoon.
@@ -31,6 +68,20 @@ describe("buildFourWeeks", () => {
     const day = (date: string) => result.days.find(d => d.date === date)!;
     expect(day("2026-09-15")).toMatchObject({ kind: "late", hours: 7.4, note: "Late, 10:42" });
     expect(day("2026-09-16")).toMatchObject({ kind: "ok", hours: 8.4 });
+    expect(result.stats.lateArrivals).toBe(1);
+  });
+
+  it("shows an excused late arrival but does not count it", () => {
+    const result = buildFourWeeks({
+      entries: [
+        { timeIn: at("2026-09-15", "10:42"), timeOut: at("2026-09-15", "18:06"), totalHours: 7.4, lateExcused: true },
+        { timeIn: at("2026-09-16", "10:50"), timeOut: at("2026-09-16", "18:39"), totalHours: 7.8 },
+      ],
+      leaves: [], overtime: [], now, ...base,
+    });
+    const day = (date: string) => result.days.find(d => d.date === date)!;
+    expect(day("2026-09-15")).toMatchObject({ kind: "ok", note: "Late, 10:42 (excused)" });
+    expect(day("2026-09-16")).toMatchObject({ kind: "late" });
     expect(result.stats.lateArrivals).toBe(1);
   });
 

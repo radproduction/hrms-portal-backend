@@ -102,6 +102,11 @@ export interface ITimeEntry extends Document {
   /** When the sweep closed it. timeOut on these rows is not a real clock-out. */
   autoClockedOutAt?: Date;
   notes?: string;
+  /**
+   * A late arrival the person explained and their head approved. The day still
+   * shows the real clock-in time, but no longer counts as a late mark.
+   */
+  lateExcused?: boolean;
   location?: {
     lat: number;
     lng: number;
@@ -123,6 +128,7 @@ const timeEntrySchema = new Schema<ITimeEntry>({
   autoClockedOut: { type: Boolean, default: false },
   autoClockedOutAt: Date,
   notes: String,
+  lateExcused: { type: Boolean, default: false },
   location: {
     lat: Number,
     lng: Number,

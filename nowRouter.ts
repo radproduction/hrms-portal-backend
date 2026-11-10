@@ -23,11 +23,13 @@ import { EmployeeRequest, WingmanMessage, WingmanSettings } from "./nowModels";
 import { MAX_SHIFT_HOURS, localDateKey } from "./attendance";
 import { isOrgWide } from "./roles";
 import { routeLeaveFor } from "./leaveRouting";
-import { clockInUser, clockOutUser, WorkClockError } from "./wingman";
+import { clockOutUser, WorkClockError } from "./wingman";
 import {
   addDays,
   buildFourWeeks,
   buildLeaveBalance,
+  explainableLateArrivals,
+  LATE_EXPLAIN_HOURS,
   localClock,
   localDayStart,
   weekdayOf,
@@ -59,13 +61,14 @@ function plainRequest(doc: any) {
   return {
     id: String(doc._id),
     userId: String(doc.userId?._id ?? doc.userId),
-    kind: doc.kind as "attendance_correction" | "support_ticket",
+    kind: doc.kind as "attendance_correction" | "support_ticket" | "late_arrival",
     subject: doc.subject as string,
     details: (doc.details ?? "") as string,
     workDate: (doc.workDate ?? null) as Date | null,
     requestedTimeIn: (doc.requestedTimeIn ?? null) as Date | null,
     requestedTimeOut: (doc.requestedTimeOut ?? null) as Date | null,
     category: (doc.category ?? null) as string | null,
+    timeEntryId: doc.timeEntryId ? String(doc.timeEntryId) : null,
     status: doc.status as "pending" | "approved" | "rejected" | "resolved",
     reviewNote: (doc.reviewNote ?? "") as string,
     reviewedAt: (doc.reviewedAt ?? null) as Date | null,
@@ -99,13 +102,14 @@ async function loadTimeData(userId: string, now: Date) {
 async function createEmployeeRequest(input: {
   userId: string;
   userName: string;
-  kind: "attendance_correction" | "support_ticket";
+  kind: "attendance_correction" | "support_ticket" | "late_arrival";
   subject: string;
   details?: string;
   workDate?: Date;
   requestedTimeIn?: Date;
   requestedTimeOut?: Date;
   category?: "it" | "equipment" | "portal" | "other";
+  timeEntryId?: string;
 }) {
   await requireDb();
   // Same routing as leave: the department head, or whoever is above them.
@@ -119,12 +123,17 @@ async function createEmployeeRequest(input: {
     requestedTimeIn: input.requestedTimeIn,
     requestedTimeOut: input.requestedTimeOut,
     category: input.category,
+    timeEntryId: input.timeEntryId ? toObjectId(input.timeEntryId) : undefined,
     approverUserId: routing.approverId ? toObjectId(routing.approverId) : undefined,
   });
   if (routing.approverId) {
     await notify(
       routing.approverId,
-      input.kind === "support_ticket" ? "Support ticket to review" : "Attendance correction to review",
+      input.kind === "support_ticket"
+        ? "Support ticket to review"
+        : input.kind === "late_arrival"
+          ? "Late arrival to review"
+          : "Attendance correction to review",
       `${input.userName}: ${input.subject}`,
       "request"
     );
@@ -163,6 +172,37 @@ async function submitLeaveDraft(userId: string, userName: string, draft: LeaveDr
 }
 
 // ---------------------------------------------------------------- requests
+
+/**
+ * The person's late clock-ins from the last LATE_EXPLAIN_HOURS, each with the
+ * explanation already sent for it, if any. Scoped to one person, so an id in
+ * here is always their own clock-in.
+ */
+async function lateArrivalsFor(userId: string, now: Date) {
+  // From the start of the office day the window opens on, so each day's
+  // first clock-in is known even if it was before the window.
+  const since = localDayStart(localDateKey(new Date(now.getTime() - LATE_EXPLAIN_HOURS * 60 * 60 * 1000)));
+  const entries = (await db.getTimeEntriesByDateRange(userId, since, now)) as any[];
+  const late = explainableLateArrivals({
+    entries: entries.map(entry => ({ ...entry, id: String(entry.id) })),
+    now,
+  });
+  if (late.length === 0) return [];
+  const sent = await EmployeeRequest.find({
+    kind: "late_arrival",
+    timeEntryId: { $in: late.map(item => toObjectId(item.timeEntryId)) },
+  }).lean();
+  const byEntry = new Map(sent.map((request: any) => [String(request.timeEntryId), request]));
+  return late.map(item => {
+    const request: any = byEntry.get(item.timeEntryId);
+    return {
+      ...item,
+      request: request
+        ? { id: String(request._id), status: request.status as string, reviewNote: (request.reviewNote ?? "") as string }
+        : null,
+    };
+  });
+}
 
 export const requestsRouter = router({
   create: protectedProcedure
@@ -207,6 +247,54 @@ export const requestsRouter = router({
     const list = await EmployeeRequest.find({ userId: toObjectId(ctx.user.id) }).sort({ createdAt: -1 }).lean();
     return list.map(plainRequest);
   }),
+
+  /** The caller's late clock-ins they can still explain (or already have). */
+  myLateArrivals: protectedProcedure.query(async ({ ctx }) => {
+    if (!(await connectToMongoDB())) return [];
+    return lateArrivalsFor(ctx.user.id, new Date());
+  }),
+
+  /** Sends the reason for a late arrival to the person's department head. */
+  explainLate: protectedProcedure
+    .input(
+      z.object({
+        timeEntryId: z.string(),
+        reason: z.string().trim().min(5, "Say a little more about why you were late").max(1000),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      await requireDb();
+      const late = (await lateArrivalsFor(ctx.user.id, new Date())).find(
+        item => item.timeEntryId === input.timeEntryId
+      );
+      if (!late) {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: `This clock-in cannot be explained any more. A late arrival can be explained within ${LATE_EXPLAIN_HOURS} hours.`,
+        });
+      }
+      if (late.request) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "You have already sent an explanation for this day" });
+      }
+      try {
+        const result = await createEmployeeRequest({
+          userId: ctx.user.id,
+          userName: ctx.user.name ?? "An employee",
+          kind: "late_arrival",
+          subject: `Late arrival, ${dayLabel(late.date)} (in at ${late.clock})`,
+          details: input.reason,
+          workDate: late.timeIn,
+          timeEntryId: late.timeEntryId,
+        });
+        return { success: true, ...result };
+      } catch (error: any) {
+        // The unique index caught a second send of the same day.
+        if (error?.code === 11000) {
+          throw new TRPCError({ code: "BAD_REQUEST", message: "You have already sent an explanation for this day" });
+        }
+        throw error;
+      }
+    }),
 
   /** Requests the caller is responsible for: everything if org-wide, else those routed to them. */
   getForReview: protectedProcedure.query(async ({ ctx }) => {
@@ -256,6 +344,9 @@ export const requestsRouter = router({
       if (request.kind === "support_ticket" && input.status === "approved") {
         throw new TRPCError({ code: "BAD_REQUEST", message: "Resolve or reject a support ticket" });
       }
+      if (request.kind === "late_arrival" && input.status === "resolved") {
+        throw new TRPCError({ code: "BAD_REQUEST", message: "Approve or reject a late arrival" });
+      }
 
       let applied = false;
       if (request.kind === "attendance_correction" && input.status === "approved" && request.workDate) {
@@ -266,6 +357,14 @@ export const requestsRouter = router({
           timeOut: request.requestedTimeOut ?? undefined,
           reviewerName: ctx.user.name ?? "a manager",
         });
+      }
+      if (request.kind === "late_arrival" && input.status === "approved" && request.timeEntryId) {
+        // Approved: the day keeps its real clock-in but stops counting as late.
+        const updated = await TimeEntry.updateOne(
+          { _id: request.timeEntryId, userId: request.userId },
+          { $set: { lateExcused: true } }
+        );
+        applied = updated.matchedCount > 0;
       }
 
       request.status = input.status;
@@ -449,13 +548,12 @@ async function answer(user: { id: string; name?: string | null }, text: string, 
     }
 
     case "clock_in":
-      try {
-        await clockInUser(user.id, { at: now });
-        return { text: `You are clocked in at ${localClock(now)}.` };
-      } catch (error) {
-        if (error instanceof WorkClockError) return { text: error.message + "." };
-        throw error;
-      }
+      // Clocking in needs the person's location, which only the clock-in
+      // button on Home can take, so the chat sends them there.
+      return {
+        text: "Clocking in needs your location, so use Clock in on Home with location turned on.",
+        link: { label: "Go to Home", href: "/dashboard" },
+      };
 
     case "clock_out": {
       if (intent.scheduled) {
@@ -684,7 +782,7 @@ export const wingmanRouter = router({
         })
       : 0;
     if (toReview > 0) {
-      waitingOnYou.push({ title: `${toReview} ${toReview === 1 ? "request" : "requests"} to review`, detail: "Corrections and tickets from your team", href: "/admin/requests" });
+      waitingOnYou.push({ title: `${toReview} ${toReview === 1 ? "request" : "requests"} to review`, detail: "Corrections, late arrivals and tickets from your team", href: "/admin/requests" });
     }
 
     // Who each pending item is with, by name, so "waiting on" names a person.

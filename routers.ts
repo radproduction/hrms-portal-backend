@@ -315,15 +315,16 @@ export const appRouter = router({
   }),
 
   timeTracking: router({
-    // Clock in
+    // Clock in. Company rule: nobody clocks in without their location, so a
+    // clock-in with no location is refused here, not just in the browser.
     clockIn: protectedProcedure
       .input(
         z
           .object({
             location: z
               .object({
-                lat: z.number(),
-                lng: z.number(),
+                lat: z.number().min(-90).max(90),
+                lng: z.number().min(-180).max(180),
                 accuracy: z.number().optional(),
                 address: z.string().optional(),
                 source: z.enum(["gps", "manual"]).optional(),
@@ -333,6 +334,12 @@ export const appRouter = router({
           .optional()
       )
       .mutation(async ({ ctx, input }) => {
+        if (!input?.location) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message: "Turn on location to clock in. Allow location for this site in your browser or phone settings, then try again.",
+          });
+        }
         try {
           return await clockInUser(ctx.user.id, { location: input?.location });
         } catch (error) {

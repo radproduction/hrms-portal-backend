@@ -58,6 +58,58 @@ function parseClock(raw: string | undefined): number | null {
 /** Minutes past midnight (office time) after which a first clock-in is late: LATE_AFTER_TIME, else 13:00. */
 export const LATE_AFTER_MINUTES = parseClock(process.env.LATE_AFTER_TIME) ?? 13 * 60;
 
+/** How long after a late clock-in the person can still send an explanation. */
+export const LATE_EXPLAIN_HOURS = 48;
+
+export type LateArrival = {
+  timeEntryId: string;
+  timeIn: Date;
+  /** Office-local "YYYY-MM-DD" of the late day. */
+  date: string;
+  /** Office-local "HH:MM" of the clock-in. */
+  clock: string;
+  /** The explanation must be sent before this. */
+  deadline: Date;
+};
+
+/**
+ * Late clock-ins the person can still explain: the first clock-in of a working
+ * day after the late cut-off, made within the last LATE_EXPLAIN_HOURS. A
+ * second clock-in the same day (back from a break, say) is never late.
+ */
+export function explainableLateArrivals(input: {
+  entries: (TimeEntryInput & { id: string })[];
+  now: Date;
+  offsetMinutes?: number;
+  workWeek?: Set<number>;
+  lateAfterMinutes?: number;
+  windowHours?: number;
+}): LateArrival[] {
+  const offsetMinutes = input.offsetMinutes ?? OFFSET_MINUTES;
+  const workWeek = input.workWeek ?? WORK_WEEK;
+  const lateAfter = input.lateAfterMinutes ?? LATE_AFTER_MINUTES;
+  const windowMs = (input.windowHours ?? LATE_EXPLAIN_HOURS) * 60 * 60 * 1000;
+
+  const firstByDay = new Map<string, TimeEntryInput & { id: string }>();
+  for (const entry of input.entries) {
+    const key = localDateKey(new Date(entry.timeIn), offsetMinutes);
+    const current = firstByDay.get(key);
+    if (!current || new Date(entry.timeIn) < new Date(current.timeIn)) firstByDay.set(key, entry);
+  }
+
+  const result: LateArrival[] = [];
+  for (const [date, entry] of Array.from(firstByDay.entries())) {
+    const timeIn = new Date(entry.timeIn);
+    if (!workWeek.has(weekdayOf(date))) continue;
+    if (localMinutes(timeIn, offsetMinutes) <= lateAfter) continue;
+    if (entry.lateExcused) continue;
+    const deadline = new Date(timeIn.getTime() + windowMs);
+    if (timeIn > input.now || deadline <= input.now) continue;
+    result.push({ timeEntryId: String(entry.id), timeIn, date, clock: localClock(timeIn, offsetMinutes), deadline });
+  }
+  return result.sort((a, b) => b.timeIn.getTime() - a.timeIn.getTime());
+}
+
 export const LEAVE_QUOTAS = {
   annual: parseNonNegative(process.env.LEAVE_QUOTA_ANNUAL, 14),
   casual: parseNonNegative(process.env.LEAVE_QUOTA_CASUAL, 10),
@@ -111,6 +163,8 @@ export type TimeEntryInput = {
   totalHours?: number | null;
   status?: string;
   autoClockedOut?: boolean;
+  /** An approved late-arrival explanation: shown, but not counted as late. */
+  lateExcused?: boolean;
 };
 
 export type LeaveInput = {
@@ -256,7 +310,10 @@ export function buildFourWeeks(input: {
     daysPresent += 1;
     const first = new Date(entries[0].timeIn);
     const firstClock = localClock(first, offsetMinutes);
-    const late = isWorkingDay && localMinutes(first, offsetMinutes) > lateAfter;
+    const clockedLate = isWorkingDay && localMinutes(first, offsetMinutes) > lateAfter;
+    // An explained and approved late arrival is shown but does not count.
+    const excused = clockedLate && Boolean(entries[0].lateExcused);
+    const late = clockedLate && !excused;
     if (late) lateArrivals += 1;
 
     let hours = 0;
@@ -317,7 +374,7 @@ export function buildFourWeeks(input: {
       hours: round1(hours),
       timeIn: firstClock,
       timeOut: lastOut ? localClock(lastOut, offsetMinutes) : null,
-      note: late ? `Late, ${firstClock}` : overtimeNote,
+      note: late ? `Late, ${firstClock}` : excused ? `Late, ${firstClock} (excused)` : overtimeNote,
     });
   }
 

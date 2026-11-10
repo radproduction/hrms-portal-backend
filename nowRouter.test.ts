@@ -7,6 +7,7 @@ import { EmployeeRequest, WingmanMessage, WingmanSettings } from "./nowModels";
 import { localDateKey } from "./attendance";
 import { addDays, localDayStart } from "./nowTime";
 import { describeWithDb } from "./test-utils";
+import { clockInUser } from "./wingman";
 
 /**
  * The Now workspace APIs: requests, the employee's own time, and Wingman.
@@ -186,14 +187,15 @@ describeWithDb("Now workspace APIs", () => {
 
   // -------------------------------------------------------------- wingman
 
-  it("clocks in and out when asked, and says so plainly when it cannot", async () => {
+  it("sends clock-in to Home (it needs location) and clocks out when asked", async () => {
+    // Clocking in needs the person's location, which the chat cannot take.
     const first = await asEmployee().wingman.ask({ text: "Clock me in" });
-    expect(first.reply.text).toMatch(/clocked in at \d\d:\d\d/);
-    expect(await TimeEntry.countDocuments({ userId: employeeId, status: "active" })).toBe(1);
+    expect(first.reply.text).toMatch(/needs your location/);
+    expect(first.reply.link?.href).toBe("/dashboard");
+    expect(await TimeEntry.countDocuments({ userId: employeeId })).toBe(0);
 
-    const again = await asEmployee().wingman.ask({ text: "clock me in" });
-    expect(again.reply.text).toMatch(/already clocked in/);
-    expect(await TimeEntry.countDocuments({ userId: employeeId })).toBe(1);
+    await clockInUser(String(employeeId), { location: { lat: 24.86, lng: 67.0 } });
+    expect(await TimeEntry.countDocuments({ userId: employeeId, status: "active" })).toBe(1);
 
     // A clock-out for later is refused rather than done now by mistake.
     const later = await asEmployee().wingman.ask({ text: "Clock me out at 7" });
@@ -207,7 +209,7 @@ describeWithDb("Now workspace APIs", () => {
 
   it("starts and ends a break only while clocked in", async () => {
     expect((await asEmployee().wingman.ask({ text: "Start my break" })).reply.text).toMatch(/not clocked in/);
-    await asEmployee().wingman.ask({ text: "clock me in" });
+    await clockInUser(String(employeeId), { location: { lat: 24.86, lng: 67.0 } });
     expect((await asEmployee().wingman.ask({ text: "Start my break" })).reply.text).toMatch(/Break started/);
     expect((await asEmployee().wingman.ask({ text: "Start my break" })).reply.text).toMatch(/already running/);
     expect((await asEmployee().wingman.ask({ text: "end my break" })).reply.text).toMatch(/Break ended/);
