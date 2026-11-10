@@ -8,9 +8,11 @@
  *
  * Three things here are policy and configurable:
  *
- *  SHIFT_START_TIME - "HH:MM" office-local, when the day starts. Default 10:00.
- *  LATE_GRACE_MINUTES - minutes after the start that still count as on time.
- *    Default 15.
+ *  LATE_AFTER_TIME - "HH:MM" office-local: a first clock-in after this is a
+ *    late arrival. Default 13:00 (company policy from 10 Nov 2026: after
+ *    1:00 PM is late; two late marks cost one day's pay).
+ *  SHIFT_START_TIME / LATE_GRACE_MINUTES - the older start-plus-grace cut-off,
+ *    no longer used for lateness (kept for callers that pass them).
  *  LEAVE_QUOTA_ANNUAL / LEAVE_QUOTA_CASUAL / LEAVE_QUOTA_SICK - days a year.
  *    Defaults 14 / 10 / 8.
  */
@@ -42,6 +44,19 @@ function parseNonNegative(raw: string | undefined, fallback: number): number {
 
 export const SHIFT_START_MINUTES = parseShiftStartMinutes();
 export const LATE_GRACE_MINUTES = parseNonNegative(process.env.LATE_GRACE_MINUTES, 15);
+
+/** "HH:MM" to minutes past midnight, or null when not a valid time. */
+function parseClock(raw: string | undefined): number | null {
+  const match = /^(\d{1,2}):(\d{2})$/.exec((raw ?? "").trim());
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours > 23 || minutes > 59) return null;
+  return hours * 60 + minutes;
+}
+
+/** Minutes past midnight (office time) after which a first clock-in is late: LATE_AFTER_TIME, else 13:00. */
+export const LATE_AFTER_MINUTES = parseClock(process.env.LATE_AFTER_TIME) ?? 13 * 60;
 
 export const LEAVE_QUOTAS = {
   annual: parseNonNegative(process.env.LEAVE_QUOTA_ANNUAL, 14),
@@ -158,8 +173,11 @@ export function buildFourWeeks(input: {
   const offsetMinutes = input.offsetMinutes ?? OFFSET_MINUTES;
   const workWeek = input.workWeek ?? WORK_WEEK;
   const weeks = input.weeks ?? 4;
+  // A caller (the tests) may pass start and grace; otherwise the policy cut-off.
   const lateAfter =
-    (input.shiftStartMinutes ?? SHIFT_START_MINUTES) + (input.lateGraceMinutes ?? LATE_GRACE_MINUTES);
+    input.shiftStartMinutes !== undefined || input.lateGraceMinutes !== undefined
+      ? (input.shiftStartMinutes ?? SHIFT_START_MINUTES) + (input.lateGraceMinutes ?? LATE_GRACE_MINUTES)
+      : LATE_AFTER_MINUTES;
   const maxShiftHours = input.maxShiftHours ?? MAX_SHIFT_HOURS;
 
   const todayKey = localDateKey(input.now, offsetMinutes);

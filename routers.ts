@@ -1605,6 +1605,10 @@ export const appRouter = router({
           title: z.string().min(1),
           content: z.string().min(1),
           priority: z.enum(["low", "medium", "high"]).default("medium"),
+          /** How many days it stays up; empty for no end date. */
+          activeDays: z.number().int().min(1).max(365).optional(),
+          /** Pop up again every day until it ends, instead of once. */
+          repeatDaily: z.boolean().optional(),
         })
       )
       .mutation(async ({ input, ctx }) => {
@@ -1616,6 +1620,8 @@ export const appRouter = router({
           content: input.content,
           priority: input.priority,
           createdBy: ctx.user.id,
+          expiresAt: input.activeDays ? new Date(Date.now() + input.activeDays * 86400000) : null,
+          repeatDaily: input.repeatDaily ?? false,
         });
 
         const users = await db.getAllUsers();

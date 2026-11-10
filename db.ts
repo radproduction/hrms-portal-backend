@@ -1,3 +1,4 @@
+import { OFFSET_MINUTES } from "./attendance";
 import bcrypt from "bcryptjs";
 import { Types } from "mongoose";
 import { connectToMongoDB } from "./mongodb";
@@ -779,7 +780,22 @@ export async function getActiveAnnouncements() {
 export async function getAnnouncementReadIds(userId: string) {
   if (!(await optionalDb())) return [];
   const reads = await AnnouncementRead.find({ userId: toObjectId(userId) }).lean();
-  return reads.map((read: any) => read.announcementId?.toString()).filter(Boolean);
+  // A "pop up every day" announcement counts as read only if it was read
+  // today (office time), so it shows again each day until it expires.
+  const daily = new Set(
+    (await Announcement.find({ repeatDaily: true }, { _id: 1 }).lean()).map(a => String(a._id))
+  );
+  const offset = OFFSET_MINUTES * 60000;
+  const local = new Date(Date.now() + offset);
+  local.setUTCHours(0, 0, 0, 0);
+  const todayStart = local.getTime() - offset;
+  return reads
+    .filter((read: any) => {
+      if (!daily.has(String(read.announcementId))) return true;
+      return new Date(read.readAt ?? 0).getTime() >= todayStart;
+    })
+    .map((read: any) => read.announcementId?.toString())
+    .filter(Boolean);
 }
 
 export async function getAnnouncementsWithReadCounts() {
@@ -810,9 +826,11 @@ export async function createAnnouncement(data: {
   createdBy: string;
   expiresAt?: Date | null;
   isActive?: boolean;
+  repeatDaily?: boolean;
 }) {
   await requireDb();
   const created = await Announcement.create({
+    repeatDaily: Boolean(data.repeatDaily),
     title: data.title,
     content: data.content,
     priority: data.priority,
@@ -902,7 +920,11 @@ export async function markAnnouncementAsRead(announcementId: string, userId: str
     await AnnouncementRead.create({
       announcementId: toObjectId(announcementId),
       userId: toObjectId(userId),
+      readAt: new Date(),
     });
+  } else {
+    // Keep the latest read, for announcements that pop up every day.
+    await AnnouncementRead.updateOne({ _id: (exists as any)._id }, { $set: { readAt: new Date() } });
   }
 }
 

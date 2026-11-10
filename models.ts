@@ -368,6 +368,8 @@ export interface IAnnouncement extends Document {
   isActive: boolean;
   createdBy: Types.ObjectId;
   expiresAt?: Date;
+  /** Pop up again every day (until it expires), not just once. */
+  repeatDaily?: boolean;
   createdAt: Date;
 }
 
@@ -378,6 +380,7 @@ const announcementSchema = new Schema<IAnnouncement>({
   isActive: { type: Boolean, default: true },
   createdBy: { type: Schema.Types.ObjectId, ref: 'User', required: true },
   expiresAt: Date,
+  repeatDaily: { type: Boolean, default: false },
   createdAt: { type: Date, default: Date.now },
 });
 

@@ -34,6 +34,23 @@ describe("buildFourWeeks", () => {
     expect(result.stats.lateArrivals).toBe(1);
   });
 
+  it("uses the 1:00 PM policy cut-off when no shift start is given", () => {
+    const { shiftStartMinutes: _s, lateGraceMinutes: _g, ...policy } = base;
+    const result = buildFourWeeks({
+      entries: [
+        { timeIn: at("2026-09-15", "13:00"), timeOut: at("2026-09-15", "21:00"), totalHours: 8 },
+        { timeIn: at("2026-09-16", "13:01"), timeOut: at("2026-09-16", "21:00"), totalHours: 8 },
+        { timeIn: at("2026-09-17", "12:10"), timeOut: at("2026-09-17", "20:00"), totalHours: 8 },
+      ],
+      leaves: [], overtime: [], now, ...policy,
+    });
+    const day = (date: string) => result.days.find(d => d.date === date)!;
+    expect(day("2026-09-15").kind).toBe("ok");
+    expect(day("2026-09-16").kind).toBe("late");
+    expect(day("2026-09-17").kind).toBe("ok");
+    expect(result.stats.lateArrivals).toBe(1);
+  });
+
   it("flags a past day that was never clocked out of, but not today's open session", () => {
     const result = buildFourWeeks({
       entries: [
