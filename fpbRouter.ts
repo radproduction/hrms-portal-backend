@@ -62,6 +62,16 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
  * This is also the read gate: a project is private to the people in it, and
  * "adding" someone would mean nothing if outsiders could open it anyway.
  */
+/**
+ * Who oversees all the work like the owner does: admins and head of ops, and
+ * the project manager (anyone an admin has given project rights to). They can
+ * open every project, every department board and anyone's boards. Assigning
+ * people on a department board stays with that department's head and admins.
+ */
+export async function overseesAllWork(ctx: { user: { id: string; role?: string } }) {
+  return isOrgWide(ctx.user.role) || (await canOpenProjects(ctx.user));
+}
+
 export async function requireProjectAccess(
   ctx: { user: { id: string; role?: string } },
   projectId: string
@@ -72,6 +82,8 @@ export async function requireProjectAccess(
   const isCreator = String((project as any).createdBy) === ctx.user.id;
   const isMember = ((project as any).memberIds ?? []).includes(ctx.user.id);
   if (isCreator || isMember) return project;
+  // The project manager sees every project, as the owner does.
+  if (await canOpenProjects(ctx.user)) return project;
   // A department head may open the boards their employees work on.
   if (isAnyHead(ctx.user.role)) {
     const team = new Set(await teamOf(ctx.user.id));
@@ -81,12 +93,15 @@ export async function requireProjectAccess(
   throw new TRPCError({ code: "FORBIDDEN", message: "You are not on this project" });
 }
 
-/** Admins may look at anyone's boards, department heads at their own employees'. */
+/**
+ * Admins and the project manager may look at anyone's boards, department
+ * heads at their own employees'.
+ */
 async function requireCanViewEmployee(
   ctx: { user: { id: string; role?: string } },
   employeeId: string
 ) {
-  if (isOrgWide(ctx.user.role)) return;
+  if (await overseesAllWork(ctx)) return;
   if (isAnyHead(ctx.user.role) && (await teamOf(ctx.user.id)).includes(employeeId)) return;
   throw new TRPCError({ code: "FORBIDDEN", message: "That person is not in your department" });
 }
@@ -609,22 +624,24 @@ export const fpbRouter = router({
         await requireCanViewEmployee(ctx, employeeId);
         return fpb.getProjects({ ...filters, visibleTo: employeeId });
       }
-      // Admins see every space; everyone else sees their own and the ones
-      // they were added to.
+      // Admins and the project manager see every space; everyone else sees
+      // their own and the ones they were added to.
       return fpb.getProjects({
         ...filters,
-        visibleTo: isOrgWide(ctx.user.role) && !employeeId ? undefined : ctx.user.id,
+        visibleTo: !employeeId && (await overseesAllWork(ctx)) ? undefined : ctx.user.id,
       });
     }),
 
   /**
-   * The people whose boards this person may look at: everyone for admins,
-   * their departments' employees for heads, nobody for anyone else.
+   * The people whose boards this person may look at: everyone for admins and
+   * the project manager, their departments' employees for heads, nobody for
+   * anyone else.
    */
   getTeamMembers: protectedProcedure.query(async ({ ctx }) => {
-    if (!isAnyHead(ctx.user.role)) return [];
+    const all = await overseesAllWork(ctx);
+    if (!all && !isAnyHead(ctx.user.role)) return [];
     const everyone = await fpb.getBoardUsers();
-    if (isOrgWide(ctx.user.role)) return everyone.filter(u => u.id !== ctx.user.id);
+    if (all) return everyone.filter(u => u.id !== ctx.user.id);
     const team = new Set(await teamOf(ctx.user.id));
     return everyone.filter(u => team.has(u.id));
   }),
@@ -1331,7 +1348,8 @@ export const fpbRouter = router({
     .query(async ({ ctx, input }) => {
       const all = await fpb.getDepartmentsWithHeads();
       const mine = await departmentsOf(ctx);
-      const visible = isOrgWide(ctx.user.role) ? all : all.filter(d => mine.all.includes(d.id));
+      // Admins and the project manager see every department's board.
+      const visible = (await overseesAllWork(ctx)) ? all : all.filter(d => mine.all.includes(d.id));
       if (visible.length === 0) {
         return { departments: [], department: null, tasks: [], people: [], canAssign: false };
       }

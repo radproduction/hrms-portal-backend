@@ -113,6 +113,26 @@ describeWithDb("Project creation rights", () => {
     expect(await caller(headId, "dept_head").fpb.canCreateProjects()).toBe(false);
   });
 
+  it("lets the project manager see every project, board and department, as the owner does", async () => {
+    // A project the member is not on, made by the admin.
+    const other = await makeProject(adminId, "admin");
+    await expect(caller(memberId, "user").fpb.getProject({ id: other.id })).rejects.toThrow(/not on this project/i);
+    expect(await caller(memberId, "user").fpb.getTeamMembers()).toEqual([]);
+
+    await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: true });
+    await expect(caller(memberId, "user").fpb.getProject({ id: other.id })).resolves.toBeTruthy();
+    const projects = await caller(memberId, "user").fpb.getProjects();
+    expect(projects.map((p: any) => p.id)).toContain(other.id);
+    const people = await caller(memberId, "user").fpb.getTeamMembers();
+    expect(people.map((u: any) => u.id)).toContain(headId);
+    // A department the member is not in.
+    const elsewhere = String((await Department.create({ name: `P${stamp} Other` }))._id);
+    const board = await caller(memberId, "user").fpb.getDepartmentBoard({ departmentId: elsewhere });
+    expect(board.department?.id).toBe(elsewhere);
+    // Assigning on a department board stays with its head and admins.
+    expect(board.canAssign).toBe(false);
+  });
+
   it("lists who holds the grant for the admin", async () => {
     await caller(adminId, "admin").admin.setUserProjectRights({ userId: memberId, allowed: true });
     const list = await caller(adminId, "admin").admin.getProjectCreators();
