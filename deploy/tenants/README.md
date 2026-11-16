@@ -85,15 +85,34 @@ that is already serving on port 80.
 
 ## The repositories
 
-Every organisation uses the same split layout: backend and frontend are
-separate repositories under different GitHub accounts, checked out side by side
-under `/srv/tenants/<name>/`.
+**Since November 2026 every organisation runs the same code**: the heard
+repositories, `radproduction/hrms-portal-backend` and
+`AsadKhan2951/hrms-portal-frontend`, checked out under `/srv/tenants/<name>/`.
+A feature pushed once reaches all three portals; deploy each tenant with
+`deploy-tenant.sh` after deploying heard. What differs per organisation is
+settings, never code:
 
-| Tenant | Backend | Frontend |
-|---|---|---|
-| heard (Rad) | `radproduction/hrms-portal-backend` | `AsadKhan2951/hrms-portal-frontend` |
-| skntheory | `radproduction/skntheory-hrms-backend` | `AsadKhan2951/skntheory-hrms-portal` |
-| movement | `radproduction/movment-hrms-backend` | `AsadKhan2951/movment-hrms-frontend` |
+| Where | What |
+|---|---|
+| `/srv/tenants/<name>/backend/.env` | its database, secrets, port, uploads folder, office geofence |
+| `/srv/tenants/<name>/frontend/.env.production.local` | `VITE_ORG_NAME=<name shown under the logo and in the tab title>` |
+
+Both files are untracked, so `git reset --hard` in a deploy leaves them alone.
+
+The old per-tenant repositories (`radproduction/skntheory-hrms-backend`,
+`AsadKhan2951/skntheory-hrms-portal`, `radproduction/movment-hrms-backend`,
+`AsadKhan2951/movment-hrms-frontend`) stopped at the August 2026 code and are
+no longer deployed. Pointing a tenant's `origin` back at them and running
+`deploy-tenant.sh` is the rollback.
+
+### Bringing an older tenant up to date
+
+`backup-tenant.mjs` copies the tenant's whole database to
+`/var/backups/hrms/` (read only). `migrate-tenant.ts` then makes the older
+data visible in the current portal, adding only: Department records from each
+person's department text, and the removed project system's projects copied
+onto the Work board. It looks only unless given `--apply`, and records what it
+copied so a second run copies nothing.
 
 The Movement repositories are spelled `movment`, without the second "e". That
 is their actual name on GitHub; the tenant and its subdomain are spelled
