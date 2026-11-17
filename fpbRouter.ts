@@ -51,7 +51,7 @@ import {
 const PRIORITY = z.enum(["low", "medium", "high", "urgent"]);
 const WORK_STATUS = z.enum(["backlog", "todo", "in_progress", "in_review", "blocked", "done"]);
 const PROJECT_TYPE = z.enum(["dev", "lead", "management", "accounting", "other"]);
-const PROJECT_SCOPE = z.enum(["social_media", "design", "saas", "website"]);
+const PROJECT_SCOPE = z.enum(["social_media", "design", "saas", "website", "seo", "marketing"]);
 const objectId = z.string().regex(/^[0-9a-fA-F]{24}$/, "Invalid id");
 
 const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;

@@ -12,7 +12,7 @@ import { Schema, model, Document, Types } from "mongoose";
 
 export type FpbProjectType = "dev" | "lead" | "management" | "accounting" | "other";
 /** What a project covers. A project can have several (e.g. website and design). */
-export const PROJECT_SCOPES = ["social_media", "design", "saas", "website"] as const;
+export const PROJECT_SCOPES = ["social_media", "design", "saas", "website", "seo", "marketing"] as const;
 export type FpbProjectScope = (typeof PROJECT_SCOPES)[number];
 export type FpbPriority = "low" | "medium" | "high" | "urgent";
 export type FpbWorkStatus = "backlog" | "todo" | "in_progress" | "in_review" | "blocked" | "done";
