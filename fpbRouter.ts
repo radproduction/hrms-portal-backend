@@ -64,9 +64,11 @@ const MAX_UPLOAD_BYTES = 8 * 1024 * 1024;
  */
 /**
  * Who oversees all the work like the owner does: admins and head of ops, and
- * the project manager (anyone an admin has given project rights to). They can
- * open every project, every department board and anyone's boards. Assigning
- * people on a department board stays with that department's head and admins.
+ * the project manager (anyone an admin has given project rights to). On the
+ * boards and department boards they have every right an admin has: open and
+ * restructure any project, assign anyone, finish any task, see every
+ * department's KPIs and activity, and moderate comments. HR rights (people,
+ * pay, leave, the organisation chart) stay with admins.
  */
 export async function overseesAllWork(ctx: { user: { id: string; role?: string } }) {
   return isOrgWide(ctx.user.role) || (await canOpenProjects(ctx.user));
@@ -123,7 +125,7 @@ export async function requireProjectOwner(
 ) {
   const project = await fpb.getProject(projectId);
   if (!project) throw new TRPCError({ code: "NOT_FOUND", message: "Project not found" });
-  if (isOrgWide(ctx.user.role)) return project;
+  if ((await overseesAllWork(ctx))) return project;
   if (String((project as any).createdBy) === ctx.user.id) return project;
   // Department heads run their teams' boards: on a project they can open, they
   // may restructure it too (delete columns, sub-projects, labels, the project).
@@ -284,7 +286,8 @@ async function mayFinish(ctx: { user: { id: string; role?: string } }, task: any
   }
   return canFinishTask({
     actorId: ctx.user.id,
-    actorIsOrgWide: isOrgWide(ctx.user.role),
+    actorIsOrgWide: (await overseesAllWork(ctx)),
+    actorIsProjectManager: await canOpenProjects(ctx.user),
     projectCreatorId: String(project?.createdBy ?? ""),
     departmentIds,
     ownerDepartmentHeadId: ownerHead,
@@ -297,7 +300,7 @@ async function mayFinish(ctx: { user: { id: string; role?: string } }, task: any
  */
 async function requireTaskManager(ctx: { user: { id: string; role?: string } }, projectId: string) {
   const project = await requireProjectAccess(ctx, projectId);
-  if (isOrgWide(ctx.user.role)) return project;
+  if ((await overseesAllWork(ctx))) return project;
   if (String((project as any).createdBy) === ctx.user.id) return project;
   if (await canOpenProjects(ctx.user)) return project;
   throw new TRPCError({
@@ -873,7 +876,7 @@ export const fpbRouter = router({
       await requireTaskAccess(ctx, found.task);
       // Deleted comments keep their place in the thread; their text (and the
       // history of edited ones) only reaches org-wide roles.
-      const orgWide = isOrgWide(ctx.user.role);
+      const orgWide = (await overseesAllWork(ctx));
       return {
         ...found,
         comments: (found.comments as unknown as CommentRecord[]).map(c => presentComment(c, orgWide)),
@@ -912,7 +915,7 @@ export const fpbRouter = router({
       if (departmentIds.length > 0) await requireTaskManager(ctx, input.projectId);
       // Nobody but an admin puts someone else straight on a task: work reaches
       // people through their department head.
-      if (input.assignedTo && input.assignedTo !== ctx.user.id && !isOrgWide(ctx.user.role)) {
+      if (input.assignedTo && input.assignedTo !== ctx.user.id && !(await overseesAllWork(ctx))) {
         throw new TRPCError({
           code: "BAD_REQUEST",
           message: "Give the task to departments; their heads choose who works on it",
@@ -1078,7 +1081,7 @@ export const fpbRouter = router({
       if (
         input.assignedTo &&
         input.assignedTo !== ctx.user.id &&
-        !isOrgWide(ctx.user.role)
+        !(await overseesAllWork(ctx))
       ) {
         throw new TRPCError({
           code: "BAD_REQUEST",
@@ -1273,7 +1276,7 @@ export const fpbRouter = router({
   getDepartmentPeople: protectedProcedure
     .input(z.object({ departmentId: objectId }))
     .query(async ({ ctx, input }) => {
-      if (!isOrgWide(ctx.user.role)) {
+      if (!(await overseesAllWork(ctx))) {
         const led = await departmentsLedBy(ctx.user.id);
         if (!led.includes(input.departmentId)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
@@ -1300,7 +1303,7 @@ export const fpbRouter = router({
       const departments = await fpb.getDepartmentsWithHeads();
       const department = departments.find(d => d.id === input.departmentId);
       const isHead = department?.headUserId === ctx.user.id;
-      if (!isHead && !isOrgWide(ctx.user.role)) {
+      if (!isHead && !(await overseesAllWork(ctx))) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Only that department's head can assign this task" });
       }
       if (input.userId) {
@@ -1360,7 +1363,7 @@ export const fpbRouter = router({
       if (input?.departmentId && department.id !== input.departmentId) {
         throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
       }
-      const canAssign = isOrgWide(ctx.user.role) || department.headUserId === ctx.user.id;
+      const canAssign = (await overseesAllWork(ctx)) || department.headUserId === ctx.user.id;
       const [tasks, people] = await Promise.all([
         fpb.getDepartmentBoardTasks(department.id),
         fpb.getDepartmentPeople(department.id),
@@ -1421,7 +1424,7 @@ export const fpbRouter = router({
       })
     )
     .query(async ({ ctx, input }) => {
-      if (!isOrgWide(ctx.user.role)) {
+      if (!(await overseesAllWork(ctx))) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Only admins can see every department" });
       }
       const { start, end } = getMonthRange(input.month, input.year);
@@ -1445,7 +1448,7 @@ export const fpbRouter = router({
   getDepartmentActivity: protectedProcedure
     .input(z.object({ departmentId: objectId, limit: z.number().int().min(1).max(200).default(50) }))
     .query(async ({ ctx, input }) => {
-      if (!isOrgWide(ctx.user.role)) {
+      if (!(await overseesAllWork(ctx))) {
         const led = await departmentsLedBy(ctx.user.id);
         if (!led.includes(input.departmentId)) {
           throw new TRPCError({ code: "FORBIDDEN", message: "That is not your department" });
@@ -1478,7 +1481,7 @@ export const fpbRouter = router({
 
   /** Work moving right now across the company, for the admin overview. */
   getOngoingTasks: protectedProcedure.query(async ({ ctx }) => {
-    if (!isOrgWide(ctx.user.role)) {
+    if (!(await overseesAllWork(ctx))) {
       throw new TRPCError({ code: "FORBIDDEN", message: "Admin access required" });
     }
     return fpb.getOngoingBoardTasks();
@@ -1657,7 +1660,7 @@ export const fpbRouter = router({
         actor: ctx.user,
         where: "comment",
       });
-      return presentComment(saved as unknown as CommentRecord, isOrgWide(ctx.user.role));
+      return presentComment(saved as unknown as CommentRecord, (await overseesAllWork(ctx)));
     }),
 
   /**
@@ -1671,7 +1674,7 @@ export const fpbRouter = router({
       if (!existing) throw new TRPCError({ code: "NOT_FOUND", message: "Comment not found" });
       const projectId = await projectIdForTask(String(existing.taskId));
       await requireProjectAccess(ctx, projectId);
-      const actor = { id: ctx.user.id, isOrgWide: isOrgWide(ctx.user.role) };
+      const actor = { id: ctx.user.id, isOrgWide: (await overseesAllWork(ctx)) };
       if (!canDeleteComment({ userId: String(existing.userId) }, actor)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
       }
@@ -1699,7 +1702,7 @@ export const fpbRouter = router({
       if (!found) throw new TRPCError({ code: "NOT_FOUND", message: "Subtask not found" });
       const projectId = await projectIdForTask(String((found.subtask as any).taskId));
       await requireProjectAccess(ctx, projectId);
-      const actor = { id: ctx.user.id, isOrgWide: isOrgWide(ctx.user.role) };
+      const actor = { id: ctx.user.id, isOrgWide: (await overseesAllWork(ctx)) };
       if (!canDeleteComment({ userId: String(existing.userId) }, actor)) {
         throw new TRPCError({ code: "FORBIDDEN", message: "You can only delete your own comment" });
       }
@@ -1730,7 +1733,7 @@ export const fpbRouter = router({
       if (input.projectId) {
         const project = await requireProjectAccess(ctx, input.projectId);
         userIds = [...new Set(projectPeople(project))];
-      } else if (isOrgWide(ctx.user.role)) {
+      } else if ((await overseesAllWork(ctx))) {
         userIds = undefined; // everyone
       } else if (isAnyHead(ctx.user.role)) {
         const led = await departmentsLedBy(ctx.user.id);
@@ -1764,7 +1767,7 @@ export const fpbRouter = router({
   getOverview: protectedProcedure
     .input(z.object({ status: z.enum(["active", "on_hold", "completed", "archived"]).optional() }).optional())
     .query(async ({ ctx, input }) => {
-      if (!isOrgWide(ctx.user.role)) {
+      if (!(await overseesAllWork(ctx))) {
         throw new TRPCError({ code: "FORBIDDEN", message: "Only admins can see every project" });
       }
       const [projects, tasks, users, departments] = await Promise.all([

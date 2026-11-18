@@ -261,11 +261,17 @@ export function columnForStage(
 export function canFinishTask(input: {
   actorId: string;
   actorIsOrgWide: boolean;
+  /**
+   * The actor holds project rights (an admin made them a project manager).
+   * A project manager runs every project, not only the ones they created.
+   */
+  actorIsProjectManager?: boolean;
   projectCreatorId: string;
   departmentIds: string[];
   ownerDepartmentHeadId: string | null;
 }): boolean {
   if (input.actorIsOrgWide) return true;
+  if (input.actorIsProjectManager) return true;
   if (input.departmentIds.length === 0) return true;
   if (input.actorId === input.projectCreatorId) return true;
   return input.ownerDepartmentHeadId !== null && input.actorId === input.ownerDepartmentHeadId;

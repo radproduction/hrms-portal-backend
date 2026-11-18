@@ -129,8 +129,10 @@ describeWithDb("Project creation rights", () => {
     const elsewhere = String((await Department.create({ name: `P${stamp} Other` }))._id);
     const board = await caller(memberId, "user").fpb.getDepartmentBoard({ departmentId: elsewhere });
     expect(board.department?.id).toBe(elsewhere);
-    // Assigning on a department board stays with its head and admins.
-    expect(board.canAssign).toBe(false);
+    // The project manager has the admin's board rights, assigning included.
+    expect(board.canAssign).toBe(true);
+    const overview = await caller(memberId, "user").fpb.getOverview();
+    expect(overview.totals.projects).toBeGreaterThan(0);
   });
 
   it("lists who holds the grant for the admin", async () => {

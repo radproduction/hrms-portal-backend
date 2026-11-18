@@ -44,6 +44,9 @@ describe("department task rules", () => {
     expect(canFinishTask({ ...base, actorId: "devHead" })).toBe(false);
     expect(canFinishTask({ ...base, actorId: "employee" })).toBe(false);
     expect(canFinishTask({ ...base, actorId: "x", actorIsOrgWide: true })).toBe(true);
+    // A project manager (project rights) may finish tasks on projects they did not create.
+    expect(canFinishTask({ ...base, actorId: "otherPm", actorIsProjectManager: true })).toBe(true);
+    expect(canFinishTask({ ...base, actorId: "otherPm", actorIsProjectManager: false })).toBe(false);
     // A task with no departments keeps the old rule.
     expect(canFinishTask({ ...base, departmentIds: [], actorId: "employee" })).toBe(true);
   });

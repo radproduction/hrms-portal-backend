@@ -874,11 +874,10 @@ describeWithDb("Flow Project Board", () => {
     try {
       const project = await as(ids.pm).fpb.createProject({ title: "Website", scopes: ["website", "design"] });
 
-      // The PM cannot hand it straight to an employee.
+      // A plain employee cannot put someone else straight on a task.
+      await as(ids.pm).fpb.updateProjectMembers({ projectId: project.id, memberIds: [ids.designer] });
       await expect(
-        as(ids.pm).fpb.createTask({
-          projectId: project.id, title: "x", departmentIds: [ids.design], assignedTo: ids.designer,
-        })
+        as(ids.designer).fpb.createTask({ projectId: project.id, title: "x", assignedTo: ids.developer })
       ).rejects.toThrow(/heads choose/);
 
       const task = await as(ids.pm).fpb.createTask({
@@ -915,10 +914,12 @@ describeWithDb("Flow Project Board", () => {
       expect(String(assigned!.assignedTo)).toBe(ids.designer);
       expect(assigned!.assignees).toHaveLength(2);
 
-      // The PM cannot reassign it directly either.
+      // On a department task, people go on through the department board, for
+      // everyone: the PM, like an admin, assigns there in any department.
       await expect(
         as(ids.pm).fpb.updateTask({ id: task.id, assignedTo: ids.developer })
       ).rejects.toThrow(/department heads assign/);
+      await as(ids.pm).fpb.assignForDepartment({ taskId: task.id, departmentId: ids.dev, userId: ids.developer });
 
       // One status for everyone: the designer moves it, the project card follows.
       await as(ids.designer).fpb.setTaskStage({ taskId: task.id, status: "in_progress" });
