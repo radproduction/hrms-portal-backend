@@ -10,7 +10,7 @@ import avatarUploadRouter from "../avatar-upload";
 import employeeDocumentUploadRouter from "../employee-document-upload";
 import fpbAttachmentsRouter, { ATTACHMENTS_PREFIX } from "../fpbAttachments";
 import { connectToMongoDB } from "../mongodb";
-import { UPLOADS_DIR } from "../storage";
+import { spacesConfig, storageFetch, UPLOADS_DIR } from "../storage";
 import { startShiftSweep } from "../shiftSweep";
 import { backfillSubprojects } from "../fpbDb";
 import { initRealtime } from "./realtime";
@@ -107,8 +107,30 @@ async function startServer() {
     }
     next();
   });
+  // With Spaces on, files come from the bucket; anything not there yet (saved
+  // before the move) falls through to the disk below.
+  const spaces = spacesConfig();
+  if (spaces) {
+    app.use("/uploads", async (req, res, next) => {
+      if (req.method !== "GET" && req.method !== "HEAD") return next();
+      try {
+        const key = path.posix.normalize(decodeURIComponent(req.path)).replace(/^\/+/, "");
+        const stored = await storageFetch(key);
+        if (!stored) return next();
+        res.setHeader("Content-Type", stored.contentType || "application/octet-stream");
+        res.setHeader("X-Content-Type-Options", "nosniff");
+        res.setHeader("Cache-Control", "private, max-age=3600");
+        res.send(stored.body);
+      } catch (error) {
+        console.error("[Uploads] could not read from Spaces", error instanceof Error ? error.message : "unknown");
+        next();
+      }
+    });
+    console.log(`[Uploads] serving Spaces bucket ${spaces.bucket}/${spaces.prefix || ""}, then ${UPLOADS_DIR}`);
+  } else {
+    console.log(`[Uploads] serving ${UPLOADS_DIR}`);
+  }
   app.use("/uploads", express.static(UPLOADS_DIR));
-  console.log(`[Uploads] serving ${UPLOADS_DIR}`);
   // Avatar upload endpoint
   app.use(avatarUploadRouter);
   // Employee document upload endpoint

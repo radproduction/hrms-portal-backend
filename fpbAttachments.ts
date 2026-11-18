@@ -13,7 +13,6 @@
  *    so an uploaded HTML or SVG page can never run on the portal's origin.
  */
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { TRPCError } from "@trpc/server";
@@ -21,7 +20,7 @@ import { authenticateRequest } from "./_core/auth";
 import * as fpb from "./fpbDb";
 import { requireProjectAccess } from "./fpbRouter";
 import { safeImageExtension } from "./fpbRules";
-import { storagePath, storagePut } from "./storage";
+import { storageFetch, storagePut } from "./storage";
 
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024;
 export const ATTACHMENTS_PREFIX = "fpb-attachments";
@@ -152,7 +151,12 @@ router.get("/api/fpb/attachments/:id", async (req, res) => {
     }
     await requireProjectAccess({ user: { id: user.id, role: user.role } }, String(found.projectId));
 
-    const data = await fs.readFile(storagePath(String(found.storageKey)));
+    const stored = await storageFetch(String(found.storageKey));
+    if (!stored) {
+      res.status(404).json({ error: "File not found" });
+      return;
+    }
+    const data = stored.body;
     const fileName = String(found.fileName ?? "file");
     const ext = found.isImage ? safeImageExtension(String(found.mimeType ?? ""), data) : null;
     const inline = Boolean(ext) && req.query.download !== "1";
